@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=77.0", "wheel", "torch>=2.10", "ninja"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "svdquant-kernels"
+version = "0.0.0"
+description = "Cross-architecture CUDA kernels for SVDQuant (W4A4 with low-rank correction)"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [{ name = "ultranationalism", email = "www913363043@gmail.com" }]
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C++",
+    "Environment :: GPU :: NVIDIA CUDA",
+]
+
+[tool.setuptools.packages.find]
+include = ["svdquant_kernels*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
