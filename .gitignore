@@ -17,3 +17,10 @@ build/
 .ruff_cache/
 .mypy_cache/
 .deps/
+cmake-build-*/
+compile_commands.json
+CMakeUserPresets.json
+CMakeCache.txt
+CMakeFiles/
+tmp/*
+!tmp/.gitkeep
