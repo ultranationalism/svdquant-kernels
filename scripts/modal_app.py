@@ -19,6 +19,16 @@ Usage:
     modal run scripts/modal_app.py::tests               # native ctest (B200)
     modal run scripts/modal_app.py::triton_smoke        # Triton correctness (RTX-PRO-6000)
     modal run scripts/modal_app.py::triton_bench        # Triton vs nunchaku bench (RTX-PRO-6000)
+    modal run scripts/modal_app.py::gemm_smoke          # gemm_w4a4 ref smoke (B200)
+    modal run scripts/modal_app.py::gemm_bench          # gemm_w4a4 vs fp16 torch bench (B200)
+    modal run scripts/modal_app.py::lora_sat_prof_bench # LoRA kernel-pure timing via torch.profiler (B200)
+
+Profiling on Modal: only the CUPTI Activity path works. `torch.profiler`
+(activity buffer) and `nsys --trace=cuda,nvtx` (kernel trace) run; `ncu`
+and `nsys --gpu-metrics-device` both hit perf-counter init that the
+host blocks (`NVreg_RestrictProfilingToAdminUsers=1`), and no container
+capability or env override changes that. For roofline / tensor-pipe
+utilization we need a different GPU host.
 """
 from __future__ import annotations
 
@@ -40,12 +50,14 @@ image = (
     .add_local_dir(str(BUILD_DIR), remote_path="/root/build", copy=False)
 )
 
-# --- Triton image (RTX PRO 6000) ------------------------------------------
+# --- Torch + nunchaku image (Triton runs + gemm harness on B200) ----------
 # Python 3.12 + torch 2.11 + cu13.0, paired with nunchaku's matching
 # cu13.0/torch2.11/cp312 wheel from the v1.2.1 GitHub release. Keeping
 # CUDA versions aligned across torch and nunchaku avoids the libcudart
 # dlopen pitfall we hit when mixing cu13 torch with a cu12-linked
 # nunchaku wheel. Triton 3.6 ships as a torch 2.11 dep, so no extra pin.
+# Same image runs on RTX PRO 6000 (Triton kernels) and B200 (gemm_w4a4
+# ref + nunchaku baseline); nunchaku's wheel includes SM_100 and SM_120.
 _NUNCHAKU_WHL = (
     "https://github.com/nunchaku-ai/nunchaku/releases/download/v1.2.1/"
     "nunchaku-1.2.1+cu13.0torch2.11-cp312-cp312-linux_x86_64.whl"
@@ -75,6 +87,21 @@ triton_image = (
     .add_local_file(
         str(ROOT / "tmp" / "smoke_fused.py"),
         remote_path="/root/svdquant-kernels/tmp/smoke_fused.py",
+        copy=False,
+    )
+    .add_local_file(
+        str(ROOT / "tmp" / "smoke_gemm.py"),
+        remote_path="/root/svdquant-kernels/tmp/smoke_gemm.py",
+        copy=False,
+    )
+    .add_local_file(
+        str(ROOT / "tmp" / "bench_gemm.py"),
+        remote_path="/root/svdquant-kernels/tmp/bench_gemm.py",
+        copy=False,
+    )
+    .add_local_file(
+        str(ROOT / "tmp" / "bench_lora_saturation_prof.py"),
+        remote_path="/root/svdquant-kernels/tmp/bench_lora_saturation_prof.py",
         copy=False,
     )
 )
@@ -125,6 +152,38 @@ def triton_bench() -> None:
     subprocess.run(["nvidia-smi"], check=True)
     subprocess.run(
         ["python", "/root/svdquant-kernels/tmp/bench_fused.py"], check=True
+    )
+
+
+@app.function(gpu="B200", image=triton_image, timeout=600)
+def gemm_smoke() -> None:
+    subprocess.run(["nvidia-smi"], check=True)
+    subprocess.run(
+        ["python", "/root/svdquant-kernels/tmp/smoke_gemm.py"], check=True
+    )
+
+
+@app.function(gpu="B200", image=triton_image, timeout=600)
+def gemm_bench() -> None:
+    subprocess.run(["nvidia-smi"], check=True)
+    subprocess.run(
+        ["python", "/root/svdquant-kernels/tmp/bench_gemm.py"], check=True
+    )
+
+
+@app.function(gpu="B200", image=triton_image, timeout=600)
+def lora_sat_prof_bench() -> None:
+    """Per-kernel device-side LoRA timing via torch.profiler CUPTI Activity.
+
+    Strips kernel-launch overhead (first-order for the tiny LoRA shapes)
+    and reports pure device-side kernel time. Uses the CUPTI activity
+    buffer, which Modal's host permits; the counter-query path (what
+    ncu and nsys --gpu-metrics-device need) is blocked at driver level.
+    """
+    subprocess.run(["nvidia-smi"], check=True)
+    subprocess.run(
+        ["python", "/root/svdquant-kernels/tmp/bench_lora_saturation_prof.py"],
+        check=True,
     )
 
 

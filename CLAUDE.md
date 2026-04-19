@@ -4,20 +4,46 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Execution environment
 
-This machine is primarily a **cross-compile / edit host**. The full
+This machine is primarily an **edit / trace-check host**. The full
 CUDA 13 toolkit (`/usr/local/cuda-13.0`, `nvcc` 13.0.88) and CANN 8.5
-toolkit (`ccec`, aarch64 `hcc` cross-toolchain) are installed, so
-`cmake` + `./scripts/build.sh` succeeds locally. There is also a
-**local consumer Blackwell GPU** (RTX 5060 Ti, SM_120) — enough to
-JIT-run Triton kernels for correctness checks, **not** enough to
-validate our native pods (they compile only for SM_100/103) or to
-produce meaningful performance numbers. There is no local Ascend NPU.
+toolkit (`ccec`, aarch64 `hcc` cross-toolchain) are installed;
+`cmake` + `./scripts/build.sh` covers the AscendC cross-compile path.
+The canonical Python venv has `cutlass-dsl` installed for CuTe DSL
+trace-level checks. There is also a **local consumer Blackwell GPU**
+(RTX 5060 Ti, SM_120) — enough to JIT-run Triton kernels for
+correctness, **not** enough to execute CuTe DSL NVFP4 kernels (SM_100
+/ SM_103 only). There is no local Ascend NPU.
 
 Remote execution lives on two serverless channels:
 
-- **CUDA / Blackwell B200 → Modal.** Build locally for `SM_100`, ship
-  `build/` (or a tarball) into a Modal function tagged `gpu="B200"`.
-  Entry point: `scripts/modal_app.py` via `modal run`.
+- **CUDA / Blackwell B200 → Modal (iterate) → Verda (deep trace).**
+  No local compile step for CUDA; Python sources (`cute_kernels/`,
+  `triton_kernels/`, `baseline/`, `tmp/`) are mounted into the Modal
+  image and JIT-compiled on-device. Entry point:
+  `scripts/modal_app.py` via `modal run`.
+
+  **Split of responsibility between the two CUDA hosts:**
+
+  - **Modal** is the fast-iteration loop — correctness smokes, wall
+    time, cheap benches. `torch.profiler(activities=[CUDA])` works
+    (CUPTI Activity buffer — per-kernel device wall time with launch
+    overhead stripped), and `nsys profile --trace=cuda,nvtx` gives the
+    kernel timeline. **Counter-level profiling does not work** on
+    Modal: host has `NVreg_RestrictProfilingToAdminUsers=1`, so `ncu`,
+    `nsys --gpu-metrics-device`, and any perf-counter query fail with
+    `LibraryNotLoaded`. No container env / capability override
+    unblocks this.
+  - **Verda** is the deep-trace host — advertises native `ncu` support
+    (perf counters unrestricted on their B200 image). Use when wall
+    time + activity trace aren't enough to explain a regression:
+    tensor-pipe busy %, SM active %, memory-workload analysis,
+    roofline, SpeedOfLight breakdown. Only go there after Modal has
+    taken the kernel as far as it can.
+
+  Canonical workflow: write → smoke + perf-iterate on Modal → if a
+  shape or version stalls below expected speedup and the activity
+  timeline doesn't explain why, pull that one kernel onto Verda for
+  roofline + ncu metrics → fix → land back on Modal.
 - **Ascend NPU / Atlas A3 → OpenI (启智社区).** Cross-build aarch64
   artifacts locally, tar them, `scripts/ship.sh` uploads to the OpenI
   dataset; the serverless pod auto-extracts at boot.
@@ -42,17 +68,21 @@ is just a known-good toolset we borrow.
 
 ### Consequences for how you work here
 
-- **Local native build is a compile-check only.** Use it to catch type
-  / symbol errors. `ctest` / bench / any runtime run of a native pod
-  only makes sense remotely (SM_100/103).
-- **Triton pods can be sanity-checked locally.** The SM_120 card is
-  fine as a Triton correctness target; just remember perf tuning must
-  happen on B200.
-- `nvcc` comes from `/usr/local/cuda-13.0/bin` — the conda `base`
-  environment ships a shadowing `nvcc` 12.8 first on PATH. `scripts/build.sh`
-  scrubs the environment with `env -i` before configuring CMake; if you
-  invoke CMake some other way, put `/usr/local/cuda` first in PATH or
-  set `CUDAToolkit_ROOT` / `CMAKE_CUDA_COMPILER` explicitly.
+- **CUDA kernels are Python CuTe DSL, JITed at first call.** No local
+  nvcc step. For trace-level sanity on a wrong-arch dev box (NVFP4 /
+  tcgen05 are rejected by the SM_120 probe), set
+  `CUTE_DSL_ARCH=sm_100a` in the environment; the MLIR still lowers.
+  Real execution only makes sense on B200.
+- **Local cmake build now only covers AscendC pods** (plus tests/bench
+  when enabled). On a CUDA-only box it produces an effectively empty
+  `build/`. That's fine — the CUDA side ships as Python source.
+- **Triton and CuTe DSL pods can be trace-/import-checked locally.**
+  The SM_120 card is fine as a Triton correctness target; for CuTe DSL
+  perf tuning has to happen on B200.
+- `nvcc` is still on PATH for the Ascend cross-compile story and any
+  future C++ CUDA pod. `scripts/build.sh` scrubs the environment with
+  `env -i` before configuring CMake to keep conda's shadowing `nvcc`
+  12.8 out of the way.
 - **Scratch artifacts go in `tmp/`** (gitignored): trace dumps pulled
   back from remote, generated sources, one-off scripts, staging
   tarballs. Don't pollute the repo root.
@@ -80,47 +110,66 @@ patch burden and the maintenance coupling. Keep the API narrow.
   scales). Ascend's cube unit has INT4 MMA but no FP4. Math mirrors
   nunchaku's pre-Blackwell INT4 path.
 
-So the native pods (`gemm_w4a4/cuda/*.cu` vs `gemm_w4a4/ascend/*.cpp`)
-are naturally format-specialized — each backend uses what its tensor
-unit actually supports. Triton pods (one source, two backends) branch
-on `fp4: bool` at the Python host layer, which becomes a `tl.constexpr`
-inside the kernel.
+So the compute-bound pods (`cute_kernels/gemm_w4a4/kernel.py` vs
+`csrc/kernels/gemm_w4a4/ascend/*.cpp`) are naturally format-specialized —
+each backend uses what its tensor unit actually supports, and the
+languages differ by necessity. Triton pods (one source, two backends)
+branch on `fp4: bool` at the Python host layer, which becomes a
+`tl.constexpr` inside the kernel.
 
-Kernels come in two flavors by compiler path:
+Kernels come in three flavors, one per compiler path:
 
-- **Native** (`csrc/kernels/<op>/`) — nvcc (CuTe DSL) or ccec
-  (AscendC). Used for compute-bound ops that need `tcgen05`
-  scaled-MMA / TMEM / 2-CTA on CUDA, or the cube unit on Ascend.
-- **Triton** (`triton_kernels/<op>/`) — one `kernel.py` JIT-compiled
-  by upstream Triton on CUDA and by `triton-ascend` on NPU. Used for
-  memory-bound ops that need to ship on both backends without writing
-  the op twice.
+- **CuTe DSL (Python)** — `cute_kernels/<op>/kernel.py`. `@cute.jit`
+  kernel + torch-tensor host wrapper, JIT-lowered through MLIR → PTX
+  by `cutlass-dsl` at first call. Used for compute-bound CUDA-only ops
+  that need `tcgen05` scaled-MMA / TMEM / 2-CTA. The Python CuTe DSL
+  is NVIDIA's authoring path on Blackwell — chosen over the CUDA C++
+  CuTe headers because the DSL cuts ~10× the template boilerplate and
+  ships directly through the same `cutlass-dsl` package used by upstream.
+- **AscendC (C++)** — `csrc/kernels/<op>/ascend/`. Host launcher +
+  `__aicore__` device code built by `ccec`. Used for compute-bound
+  Ascend-only ops that need the cube unit.
+- **Triton** — `triton_kernels/<op>/kernel.py`. One `@triton.jit`
+  kernel JIT-compiled by upstream Triton on CUDA and by `triton-ascend`
+  on NPU. Used for memory-bound ops that ship on both backends without
+  writing the op twice.
 
-Decision rule: if AI is well below B200's FP16 tensor-core ridge
-(~281 FLOP/B) **and** the op needs Ascend coverage, it's a Triton
-kernel. Otherwise it's native per backend.
+Decision rule: memory-bound + cross-backend → Triton. Compute-bound
+CUDA (needs tcgen05) → CuTe DSL. Compute-bound Ascend (needs the cube
+unit) → AscendC. No shared header between CuTe DSL and AscendC because
+the languages differ.
 
 It is explicitly **not** a shipping library. Consequences that affect how
 you work here:
 
-- **No runtime dispatcher.** Callers pick `svdquant::cuda::<op>` or
-  `svdquant::ascend::<op>` directly. Do not add a router. If you think
-  one is needed, you're in the wrong repo — that belongs to whoever
-  integrates these kernels into a framework.
-- **No Python bindings (yet).** PyTorch appears only under `baseline/` as
-  numerical ground truth. Do not pull `torch` into `csrc/` or
-  `svdquant_kernels/`. Bindings come later, after kernels stabilize.
-- **Pods are OBJECT libs, not a single `.so`.** Linking into a shared
-  library is an integration concern.
+- **No runtime dispatcher.** Callers pick the backend directly — for
+  CUDA that's the Python `cute_kernels.<op>.launch(...)` (or
+  `triton_kernels.<op>.launch(...)`); for Ascend that's
+  `svdquant::ascend::<op>(...)` in C++. Do not add a router. If you
+  think one is needed, you're in the wrong repo — that belongs to
+  whoever integrates these kernels into a framework.
+- **Torch only in Python host wrappers.** `baseline/`, `cute_kernels/`,
+  and `triton_kernels/` take torch tensors at their host boundary.
+  Do not pull `torch` into `csrc/`; AscendC-side Python bindings come
+  later, after kernels stabilize.
+- **C++ pods are OBJECT libs, not a single `.so`.** Linking is an
+  integration concern. Python pods (CuTe DSL, Triton) are plain
+  modules under their respective trees.
 
-Current state: scaffold. Every pod's `kernel.cu` / `kernel.cpp` is a
-host-side stub so the build wires end-to-end before any real kernel lands.
+Current state: the Triton pod `quantize_w4a4_act_fuse_lora` is real
+and passes smoke. The CuTe DSL `gemm_w4a4` is in progress — the
+shared-tmem feasibility check lives at `tmp/verify_tmem_layout.py`.
+All AscendC pods are host-side stubs so the build stays green before
+real device code lands. The leftover CUDA C++ stub under
+`csrc/kernels/gemm_w4a4/cuda/kernel.cu` is obsolete (predates the CuTe
+DSL decision) and should be removed when `cute_kernels/gemm_w4a4/`
+lands.
 
 ## Build
 
-Both backends are probed independently and each is an `option()`. Missing
-toolchains downgrade to a warning, not an error — so on a CUDA-only box
-Ascend silently disables, and vice versa.
+`scripts/build.sh` drives CMake, which now only covers AscendC pods
+(+ tests/bench when enabled). CUDA CuTe DSL and Triton pods don't go
+through CMake — they're Python modules that JIT on first call.
 
 ```
 # defaults: both backends on, tests/bench off
@@ -137,21 +186,44 @@ TESTS=ON BENCH=ON ./scripts/build.sh
 BUILD_TYPE=Debug ./scripts/build.sh
 ```
 
+The `CUDA=ON` branch is retained as a placeholder for any future C++
+CUDA pod; with all current CUDA work living in `cute_kernels/`, a
+CUDA-only CMake configure produces an effectively empty `build/`.
+
 Before configuring on an Ascend machine: `source scripts/env_ascend.sh`
 (sources CANN's `setenv.bash` / `set_env.sh`). Override the CANN
 location with `ASCEND_HOME_PATH=...`.
 
 Direct CMake flags if you need them:
 `-DSVDQUANT_ENABLE_CUDA`, `-DSVDQUANT_ENABLE_ASCEND`,
-`-DSVDQUANT_BUILD_TESTS`, `-DSVDQUANT_BUILD_BENCHMARKS`,
-`-DSVDQUANT_CUDA_ARCHS="100;103"` (default; data-center Blackwell only — see
-`cmake/cuda_arch.cmake`).
+`-DSVDQUANT_BUILD_TESTS`, `-DSVDQUANT_BUILD_BENCHMARKS`. The
+`SVDQUANT_CUDA_ARCHS` CMake knob only affects any future C++ CUDA
+pod; for CuTe DSL kernels the arch is set at JIT time via
+`CUTE_DSL_ARCH` (see "Conventions" below).
 
-No lint/test commands exist yet — the repo is scaffold-only.
+No lint command yet. The Triton pod `quantize_w4a4_act_fuse_lora` has
+a working smoke (`tmp/smoke_fused.py`); the CuTe DSL `gemm_w4a4` is
+mid-implementation.
 
 ## Adding a new kernel pod
 
-### Native pod (CuTe DSL / AscendC)
+### CuTe DSL pod (CUDA)
+
+No CMake line. Drop a directory under `cute_kernels/`:
+
+```
+cute_kernels/<op>/
+  kernel.py             # @cute.jit kernel + torch-tensor host wrapper
+  README.md             # op contract + ref anchor (usually a nunchaku or CUTLASS example)
+```
+
+`cutlass-dsl` JITs at first call; there's nothing to build ahead of
+time. Already installed in the canonical venv and the Modal triton
+image. On a non-B200 dev box (SM_120 here), export
+`CUTE_DSL_ARCH=sm_100a` before running so NVFP4 / tcgen05 MMA atoms
+pass the arch gate at trace time.
+
+### AscendC pod (NPU)
 
 One line in `csrc/kernels/CMakeLists.txt`:
 
@@ -159,23 +231,22 @@ One line in `csrc/kernels/CMakeLists.txt`:
 svdquant_add_kernel_pod(<op>)
 ```
 
-Pod layout the helper expects:
+Pod layout:
 
 ```
 csrc/kernels/<op>/
-  include/<op>.h        # struct <Op>Params; svdquant::{cuda,ascend}::<op> decls
-  cuda/kernel.cu        # optional — skipped if missing
-  ascend/kernel.cpp     # optional — skipped if missing
+  include/<op>.h        # struct <Op>Params; svdquant::ascend::<op> decl
+  ascend/kernel.cpp     # host launcher
+  ascend/kernel_device.cpp   # __aicore__ device code (ccec rule not wired yet)
   README.md
 ```
 
-The helper globs by exact filename (`cuda/kernel.cu`, `ascend/kernel.cpp`).
-Extra per-SM files (e.g. `cuda/sm100.cu`) should be added from inside
-`kernel.cu` via `#include` or wired into the helper as the need arises.
+The helper still looks for `cuda/kernel.cu` for back-compat; leave that
+unset for new pods — CUDA CuTe DSL goes under `cute_kernels/<op>/`.
 
 ### Triton pod (CUDA + Ascend)
 
-No CMake line. Just drop a directory under `triton_kernels/`:
+No CMake line. Drop a directory under `triton_kernels/`:
 
 ```
 triton_kernels/<op>/
@@ -189,32 +260,34 @@ path — not required for local edit / CUDA runs.
 
 ## Conventions that aren't obvious from the code
 
-- **Op signatures live in the pod's `include/<op>.h`** — one header per
-  op, declaring a `<Op>Params` struct and two launch functions with
-  identical signatures: `svdquant::cuda::<op>(params, void* stream)` and
-  `svdquant::ascend::<op>(params, void* stream)`. Keep these two in
-  sync; divergence defeats the point of the workbench.
-- **`void* stream`, not `cudaStream_t` / `aclrtStream`.** Keeps the
-  public header free of backend includes. Cast inside `kernel.cu` /
-  `kernel.cpp`.
-- **`TensorRef::data` is opaque.** Each backend interprets it as its own
-  device pointer type. Strides are in elements, not bytes.
+- **No shared signature between CUDA and Ascend.** The CUDA side is a
+  Python host wrapper in `cute_kernels/<op>/kernel.py` (or
+  `triton_kernels/<op>/kernel.py`) that takes torch tensors; the Ascend
+  side is a C++ function declared in `csrc/kernels/<op>/include/<op>.h`
+  taking a `<Op>Params` + `void* stream`. Keep the *math* and *tensor
+  shapes* in sync — the languages differ by necessity.
+- **`void* stream` on the Ascend C API.** `aclrtStream` is opaquely
+  cast inside `kernel.cpp` so the public header stays free of CANN
+  includes.
+- **`TensorRef` is Ascend-only.** `data` is an opaque device pointer
+  interpreted by the backend; strides are in elements, not bytes.
 - **AscendC split:** `ascend/kernel.cpp` is the host launcher, compiled
   by the host C++ compiler. Real device code (`__aicore__`) goes into a
   sibling file (convention: `ascend/kernel_device.cpp`) compiled by
   `ccec`. That `ccec` rule is **not wired yet** — add it the first time
   a pod needs real device code, not before.
-- **Per-SM CUDA variants:** new SM numbers go into `SVDQUANT_CUDA_ARCHS`
-  in `cmake/cuda_arch.cmake`. Each listed arch auto-gets a
-  `SVDQUANT_HAS_SM<N>=1` compile define so source files can opt in
-  without touching CMake.
+- **CUDA arch selection is runtime, not CMake.** `cutlass-dsl` probes
+  the device at trace time; override with `CUTE_DSL_ARCH=sm_100a` or
+  `sm_103a` for trace checks on a wrong-arch dev box (SM_120 locally)
+  or for an AOT-compiled cubin. There is no `SVDQUANT_CUDA_ARCHS`
+  equivalent on the CuTe DSL path.
 - **`baseline/` is PyTorch-only and must stay importable without any
   kernel having built.** It's ground truth for tests — readability
   beats speed, no `torch.compile`, no fused ops, no backend tricks.
-- **Triton kernels in `triton_kernels/` are NOT tests or baselines.**
-  They are real kernels that ship; the only difference from native
-  pods is the compiler path (Triton → PTX/AscendC instead of nvcc).
-  Treat them as production surface.
+- **Python kernels in `cute_kernels/` and `triton_kernels/` are NOT
+  tests or baselines.** They are real kernels that ship; the only
+  difference from AscendC is the compiler path (MLIR or Triton → PTX
+  instead of `ccec`). Treat them as production surface.
 
 ## The two ops (why this split)
 
@@ -228,7 +301,7 @@ public C++ API (`tmp/nunchaku/src/kernels/zgemm/gemm_w4a4.cu`):
   ↓   → lora_act_out = x @ lora_down                                       [M, R] fp32
   ↓   → ascales                                                            [K/16, M] fp8
 [act, lora_act_in, ascales]
-  ↓ gemm_w4a4(act, lora_act_in, wgt, lora_up, ascales, wscales,     ← CuTe DSL (CUDA)
+  ↓ gemm_w4a4(act, lora_act_in, wgt, lora_up, ascales, wscales,     ← CuTe DSL Python (CUDA)
   ↓           bias, wcscales, [qout, oscales, smooth_next])           ← AscendC (NPU)
   ↓   → y_fp = scaled_mma(act, wgt) · wcscale + bias
   ↓   → y_fp += lora_act_in @ lora_up
@@ -241,9 +314,10 @@ preceding SwiGLU (`gate ⊙ silu(value)`) into the load step. We do
 **not** replicate it — see the "What this repo is" section above;
 vLLM pipeline intrusion is out of scope.
 
-- `gemm_w4a4` (native pod) — compute-bound scaled-MMA + LoRA-up
-  residual + bias + optional next-layer quantize. The numbers that
-  need `tcgen05` / `TMEM` / 2-CTA live here.
+- `gemm_w4a4` — compute-bound scaled-MMA + LoRA-up residual + bias +
+  optional next-layer quantize. CUDA side is a CuTe DSL pod at
+  `cute_kernels/gemm_w4a4/kernel.py`; Ascend side (future) is an
+  AscendC pod. This is where `tcgen05` / `TMEM` / 2-CTA live.
 - `quantize_w4a4_act_fuse_lora` (Triton pod) — memory-bound
   preprocessing: quantize input + do the small `x @ lora_down`
   down-projection. Measured AI 26–120 FLOP/B on ZImage Turbo
