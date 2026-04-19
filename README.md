@@ -1,13 +1,17 @@
 # svdquant-kernels
 
-Cross-architecture kernels for SVDQuant (W4A4 with low-rank correction).
-Targets both NVIDIA GPUs (CUDA) and Huawei Ascend NPUs (AscendC) from a
-single source tree.
+SVDQuant (W4A4 + low-rank correction) kernels **for vLLM**. The goal
+is to back vLLM's diffusion path with 4-bit kernels on both NVIDIA
+Blackwell (SM_100/103, **NVFP4**) and Huawei Ascend NPUs (**INT4**)
+from a single source tree. Each backend uses the 4-bit format its
+tensor unit actually supports.
 
-**This is a kernel development workbench**, not a production library.
-There is no Python dispatcher and no framework integration — each kernel
-is built, tested, and profiled in isolation. Framework bindings
-(PyTorch etc.) come later.
+**This is a kernel development workbench**, not yet a library. There
+is no Python dispatcher and no framework integration yet — each kernel
+is built, tested, and profiled in isolation. vLLM bindings land after
+the kernels stabilize; fusions that would require vLLM pipeline
+changes (e.g., folding a preceding GLU into a quantize op) are
+explicitly out of scope so the kernels stay drop-in.
 
 ## Layout
 

@@ -60,10 +60,31 @@ is just a known-good toolset we borrow.
 ## What this repo is (and isn't)
 
 A **kernel development workbench** for SVDQuant (W4A4 linear with low-rank
-correction), targeting both NVIDIA GPUs (CUDA) and Huawei Ascend NPUs
-(AscendC) from one source tree. Hardware scope: **SM_100 / SM_103
-only** on the CUDA side (nunchaku covers everything else — see
-`tmp/nunchaku/setup.py:41-64`).
+correction), **targeting vLLM's diffusion path**. Cross-architecture:
+NVIDIA GPUs (CUDA, SM_100/SM_103 data-center Blackwell only — nunchaku
+covers everything else, see `tmp/nunchaku/setup.py:41-64`) and Huawei
+Ascend NPUs (AscendC) from one source tree.
+
+Because vLLM is the consumer, kernels must be **drop-in at the linear
+boundary**: `input → svdquant_op → output`. Fusions that would require
+modifying vLLM's own pipeline (e.g., absorbing a preceding SwiGLU / GeGLU
+gate into a quantize op, as nunchaku does with `fuse_glu`) are
+**explicitly out of scope** — the perf win isn't worth the upstream
+patch burden and the maintenance coupling. Keep the API narrow.
+
+**4-bit format splits by backend**:
+- **CUDA (SM_100/103)**: NVFP4 only (E2M1 values + 16-element FP8-E4M3
+  block scales). Blackwell tcgen05 dropped INT4 scaled-MMA; CuTe DSL's
+  `make_blockscaled_trivial_tiled_mma` only exposes MXF4/NVFP4/MXF8.
+- **Ascend NPU**: INT4 (signed INT4 values + per-64-K-block FP16
+  scales). Ascend's cube unit has INT4 MMA but no FP4. Math mirrors
+  nunchaku's pre-Blackwell INT4 path.
+
+So the native pods (`gemm_w4a4/cuda/*.cu` vs `gemm_w4a4/ascend/*.cpp`)
+are naturally format-specialized — each backend uses what its tensor
+unit actually supports. Triton pods (one source, two backends) branch
+on `fp4: bool` at the Python host layer, which becomes a `tl.constexpr`
+inside the kernel.
 
 Kernels come in two flavors by compiler path:
 
@@ -202,7 +223,7 @@ public C++ API (`tmp/nunchaku/src/kernels/zgemm/gemm_w4a4.cu`):
 
 ```
 [fp x]
-  ↓ quantize_w4a4_act_fuse_lora(x, lora_down, smooth, fuse_glu)     ← Triton
+  ↓ quantize_w4a4_act_fuse_lora(x, lora_down, smooth)               ← Triton
   ↓   → act_nvfp4 = quant(x / smooth)                                      [M, K/2]
   ↓   → lora_act_out = x @ lora_down                                       [M, R] fp32
   ↓   → ascales                                                            [K/16, M] fp8
@@ -214,6 +235,11 @@ public C++ API (`tmp/nunchaku/src/kernels/zgemm/gemm_w4a4.cu`):
   ↓   → [optional] qout = quant(y_fp / smooth_next)                        for next layer
 [y (, optional qout/oscales)]
 ```
+
+Note: nunchaku's kernel has an extra `fuse_glu` flag that folds the
+preceding SwiGLU (`gate ⊙ silu(value)`) into the load step. We do
+**not** replicate it — see the "What this repo is" section above;
+vLLM pipeline intrusion is out of scope.
 
 - `gemm_w4a4` (native pod) — compute-bound scaled-MMA + LoRA-up
   residual + bias + optional next-layer quantize. The numbers that

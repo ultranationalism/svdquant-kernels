@@ -108,15 +108,25 @@ def lora_down(
 
 
 def quantize_w4a4_act_fuse_lora(
-    input: torch.Tensor,             # [M, actualN]   fp16/bf16
-    lora_down: torch.Tensor,         # [N, R]         fp16/bf16
-    smooth: Optional[torch.Tensor],  # [N]            fp16/bf16 or None
+    input: torch.Tensor,             # [M, N]   fp16/bf16
+    lora_down: torch.Tensor,         # [N, R]   fp16/bf16 (smooth pre-absorbed offline)
+    smooth: Optional[torch.Tensor],  # [N]      fp16/bf16 or None
     *,
-    fp4: bool,                       # True = NVFP4 output, False = INT4
-    fuse_glu: bool = False,
+    fp4: bool,                       # True = NVFP4 (CUDA), False = INT4 (Ascend)
     pad_size: int = 256,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Full fused op — not yet implemented. See README.md."""
+    """Full fused op — not yet implemented. See README.md.
+
+    Output format picks per backend: NVFP4 on CUDA (B200 tcgen05 has
+    no INT4 scaled-MMA), INT4 on Ascend (its cube unit has no FP4).
+    Caller passes `fp4` explicitly — we don't auto-detect from the
+    tensor's device because triton-ascend may or may not show up as
+    a distinct device type depending on the install.
+
+    We don't support nunchaku's `fuse_glu` path: that would require
+    vLLM to hand us the pre-GLU [M, 2N] tensor, which is a pipeline
+    intrusion we're avoiding.
+    """
     raise NotImplementedError(
         "Triton kernel body pending. See README.md for the contract "
         "and `tmp/nunchaku/src/kernels/zgemm/gemm_w4a4.cuh:1096` for "
