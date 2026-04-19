@@ -1,20 +1,29 @@
 #pragma once
 // SVDQuant operator catalog (index).
 //
-// Each operator pod under csrc/kernels/<op>/ owns its own public header with
-// the concrete host-callable launch signature. This file is the directory:
+// Each native operator pod under csrc/kernels/<op>/ owns its own
+// public header with the concrete host-callable launch signature.
+// Triton-based ops aren't declared here — they're Python entries
+// under triton_kernels/<op>/.
 //
-//   w4a4_gemm              csrc/kernels/w4a4_gemm/include/w4a4_gemm.h
-//   lowrank_branch         csrc/kernels/lowrank_branch/include/lowrank_branch.h
-//   fused_svdquant_linear  csrc/kernels/fused_svdquant_linear/include/fused_svdquant_linear.h
-//   quantize_act_int4      csrc/kernels/quantize_act_int4/include/quantize_act_int4.h
-//   pack_weight_int4       csrc/kernels/pack_weight_int4/include/pack_weight_int4.h
+//   Native (CuTe DSL / AscendC):
+//     gemm_w4a4                 csrc/kernels/gemm_w4a4/include/gemm_w4a4.h
 //
-// Every pod declares two backend namespaces:
+//   Triton (CUDA + Ascend via triton-ascend, same source):
+//     quantize_w4a4_act_fuse_lora  triton_kernels/quantize_w4a4_act_fuse_lora/kernel.py
+//
+// Weight packing (FP → INT4/NVFP4 + block scales) is an offline,
+// one-shot calibration step; it lives as a pure-Python utility in
+// baseline/, not as a kernel pod — TMA makes on-device tile re-layout
+// cheap enough that baking a tile layout into the packed format buys
+// nothing.
+//
+// Every native pod declares two backend namespaces:
 //
 //   namespace svdquant::cuda   { ... }
 //   namespace svdquant::ascend { ... }
 //
-// with identical launch signatures. Dispatch to a specific backend is the
-// caller's responsibility — there is no runtime router in this repo, which
-// is intentional: this is a kernel development workbench, not a product.
+// with identical launch signatures. Dispatch to a specific backend is
+// the caller's responsibility — there is no runtime router in this
+// repo, which is intentional: this is a kernel development workbench,
+// not a product.

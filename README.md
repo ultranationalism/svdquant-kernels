@@ -14,12 +14,16 @@ is built, tested, and profiled in isolation. Framework bindings
 ```
 csrc/
   common/                  headers shared across backends (dtype, TensorRef, macros)
-  kernels/
+  kernels/                 native pods — nvcc (CuTe DSL) or ccec (AscendC)
     <op>/
       include/<op>.h       op's public header (backend-agnostic signature)
       cuda/kernel.cu       CUDA implementation
       ascend/kernel.cpp    AscendC host launcher (device code added later)
       README.md
+triton_kernels/            Triton pods — one source, runs on CUDA + Ascend
+  <op>/
+    kernel.py              @triton.jit + torch-tensor host wrapper
+    README.md
 baseline/                  PyTorch reference implementations (numerical ground truth)
 tests/                     per-op numerical correctness tests
 benchmarks/                per-op micro-benchmarks
@@ -28,18 +32,22 @@ cmake/                     FindCANN.cmake, cuda_arch.cmake
 scripts/                   build.sh, env_ascend.sh
 ```
 
-## The five ops
+## The two ops
 
-SVDQuant decomposes `y = x @ W` as
-`dequant(int4(x) @ int4(W')) + x @ L1 @ L2`. The pods mirror that:
+A W4A4→W4A4 linear chain is two kernels, mirroring nunchaku's public
+C++ API:
 
-| Pod                       | Role                                           |
-|---------------------------|------------------------------------------------|
-| `pack_weight_int4`        | Offline: FP weight → INT4 + per-group scale    |
-| `quantize_act_int4`       | Online: dynamic per-token INT4 activation      |
-| `w4a4_gemm`               | INT4 × INT4 GEMM with scales (main quant path) |
-| `lowrank_branch`          | `x @ L1 @ L2` residual                         |
-| `fused_svdquant_linear`   | The three online ops fused end-to-end          |
+| Pod                                                      | Location               | Library   | Role |
+|----------------------------------------------------------|------------------------|-----------|------|
+| [`gemm_w4a4`](csrc/kernels/gemm_w4a4/)                   | `csrc/kernels/`        | CuTe DSL (CUDA) / AscendC (NPU) | Main W4A4 scaled-MMA + LoRA-up residual + bias + optional next-layer quantize |
+| [`quantize_w4a4_act_fuse_lora`](triton_kernels/quantize_w4a4_act_fuse_lora/) | `triton_kernels/`      | Triton    | Memory-bound preprocessing: NVFP4 quantize of input + `x @ lora_down` small GEMM |
+
+Library choice: compute-bound ops that need `tcgen05` / TMEM / 2-CTA
+go native per backend; memory-bound ops that need to run on both CUDA
+and Ascend go through Triton (one `.py` source, two hardware targets).
+
+Weight packing (FP → INT4/NVFP4 + block scales) is offline and lives
+as a pure-Python utility in `baseline/` — no kernel pod.
 
 ## Build
 

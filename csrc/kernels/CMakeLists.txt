@@ -25,8 +25,10 @@ function(svdquant_add_kernel_pod name)
     add_library(svdquant::${name} ALIAS svdquant_${name})
 endfunction()
 
-svdquant_add_kernel_pod(w4a4_gemm)
-svdquant_add_kernel_pod(lowrank_branch)
-svdquant_add_kernel_pod(fused_svdquant_linear)
-svdquant_add_kernel_pod(quantize_act_int4)
-svdquant_add_kernel_pod(pack_weight_int4)
+svdquant_add_kernel_pod(gemm_w4a4)
+
+# Preprocessing op `quantize_w4a4_act_fuse_lora` is memory-bound and
+# needs to run on both CUDA and Ascend, so it lives in the Triton
+# directory (`triton_kernels/`) instead of here — Triton's Python +
+# LLVM toolchain isn't driven by CMake. See `triton_kernels/README.md`
+# for the library-choice rationale.
