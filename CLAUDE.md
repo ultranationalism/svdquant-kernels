@@ -160,10 +160,10 @@ Current state: the Triton pod `quantize_w4a4_act_fuse_lora` is real
 and passes smoke. The CuTe DSL `gemm_w4a4` is in progress — the
 shared-tmem feasibility check lives at `tmp/verify_tmem_layout.py`.
 All AscendC pods are host-side stubs so the build stays green before
-real device code lands. The leftover CUDA C++ stub under
-`csrc/kernels/gemm_w4a4/cuda/kernel.cu` is obsolete (predates the CuTe
-DSL decision) and should be removed when `cute_kernels/gemm_w4a4/`
-lands.
+real device code lands. The Ascend-side `gemm_w4a4` pod under
+`csrc/kernels/gemm_w4a4/` keeps only the host header + stub; the
+CUDA path moved out to `cute_kernels/gemm_w4a4/` (Python CuTe DSL,
+JITed on-device).
 
 ## Build
 

@@ -1,33 +1,36 @@
 #pragma once
-// gemm_w4a4 — main SVDQuant W4A4 linear kernel.
+// gemm_w4a4 — main SVDQuant W4A4 linear kernel (Ascend C-side header).
 //
-// Consumes packed NVFP4 (or INT4) activation + FP8 block scales,
-// packed NVFP4 (or INT4) weight + FP8 block scales, runs
-// `tcgen05`-based scaled-MMA (CUDA SM_100/SM_103) or AscendC cube
-// GEMM (NPU), accumulates the SVDQuant low-rank residual
-// `lora_act_in @ lora_up` in the epilogue, optionally biases /
-// rescales, and optionally re-quantizes the result for the next
-// layer.
+// This header declares the **Ascend-side** C++ entry point only. The
+// CUDA path does not go through C++ at all — it is a CuTe DSL kernel
+// under `cute_kernels/gemm_w4a4/kernel.py`, called directly from
+// Python with torch tensors. Keep this header free of CUDA decls.
+//
+// Consumes packed INT4 activation + FP16 block scales, packed INT4
+// weight + FP16 block scales, runs AscendC cube GEMM, accumulates the
+// SVDQuant low-rank residual `lora_act_in @ lora_up` in the epilogue,
+// optionally biases / rescales, and optionally re-quantizes the result
+// for the next layer. (The CUDA / NVFP4 math is the same at the
+// tensor-shape level; only the 4-bit format and the tensor-unit
+// language differ — see CLAUDE.md "4-bit format splits by backend".)
 //
 // This is the compute-bound half of SVDQuant. The memory-bound
 // preprocessing op that produces `act` / `ascales` / `lora_act_in`
 // lives in `triton_kernels/quantize_w4a4_act_fuse_lora/` (Triton,
 // shared across CUDA and Ascend).
 //
-// Logical shapes (packed layout is backend-specific; strides in
-// elements):
-//   act          [M,   K/2]   uint8     2 NVFP4 E2M1 / byte
-//   wgt          [N,   K/2]   uint8     2 NVFP4 E2M1 / byte
-//   ascales      [K/16, M]    fp8_e4m3  per-16-K-block, one scale/block
-//   wscales      [K/16, N]    fp8_e4m3  per-16-K-block, one scale/block
+// Logical shapes (Ascend INT4 packed layout; strides in elements):
+//   act          [M,   K/2]   uint8     2 signed INT4 / byte
+//   wgt          [N,   K/2]   uint8     2 signed INT4 / byte
+//   ascales      [K/64, M]    fp16      per-64-K-block act scale
+//   wscales      [K/64, N]    fp16      per-64-K-block weight scale
 //   lora_act_in  [M,   R]     fp32      = fpsum @ lora_down from previous op
 //   lora_up      [N,   R]     fp16/bf16
 //   bias         [N]          fp16/bf16 (optional)
-//   wcscales     [N]          fp16/bf16 (optional, NVFP4 path)
 //   smooth       [N_next]     fp16/bf16 (optional; next layer's smooth factor)
 //   out          [M, N]       fp16/bf16
 //   qout         [M, N/2]     uint8     (optional) pre-quantized output for next layer
-//   oscales      [N/16, M]    fp8_e4m3  (optional) matching scales for `qout`
+//   oscales      [N/64, M]    fp16      (optional) matching scales for `qout`
 //
 // Reference: `tmp/nunchaku/src/kernels/zgemm/gemm_w4a4.cu:34-105`
 // (the `gemm_w4a4` host launcher; we intentionally omit nunchaku's
@@ -51,7 +54,6 @@ struct GemmW4A4Params {
 
     // Optional per-channel affine on the main output
     TensorRef bias;       // may be .data == nullptr
-    TensorRef wcscales;   // may be .data == nullptr (NVFP4 only)
     float     alpha;      // per-tensor weight scale multiplier
 
     // Main output
@@ -62,11 +64,8 @@ struct GemmW4A4Params {
     TensorRef qout;
     TensorRef oscales;
     TensorRef smooth;
-
-    bool use_fp4;   // true = NVFP4 tcgen05 path, false = INT4 path
 };
 
-namespace cuda   { void gemm_w4a4(const GemmW4A4Params& p, void* stream); }
 namespace ascend { void gemm_w4a4(const GemmW4A4Params& p, void* stream); }
 
 }  // namespace svdquant

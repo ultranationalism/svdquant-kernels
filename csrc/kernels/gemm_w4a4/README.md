@@ -1,15 +1,19 @@
-# gemm_w4a4
+# gemm_w4a4 — Ascend pod
 
 Main W4A4 linear — compute-bound, tensor-core-first. Consumes
-pre-quantized NVFP4 activation + weight (produced by
+pre-quantized INT4 activation + weight (produced by
 `triton_kernels/quantize_w4a4_act_fuse_lora/` on the previous layer),
-runs scaled-MMA, accumulates the SVDQuant low-rank residual, and
+runs cube-unit GEMM, accumulates the SVDQuant low-rank residual, and
 (optionally) produces pre-quantized output for the next layer.
 
-Signature: see `include/gemm_w4a4.h`.
+This directory is the **Ascend** side of `gemm_w4a4`. The CUDA / NVFP4
+side does not go through C++ — it is a CuTe DSL pod at
+`cute_kernels/gemm_w4a4/kernel.py` (called directly from Python with
+torch tensors). Formats split by backend: NVFP4 on CUDA, INT4 on
+Ascend (see CLAUDE.md "4-bit format splits by backend"). Kept in the
+same op name because the math, shapes, and dataflow are identical.
 
-CUDA path: CuTe DSL over `tcgen05.mma.kind::mxf4nvf4` on SM_100 /
-SM_103. Ascend path: AscendC cube unit (not wired yet).
+Signature: see `include/gemm_w4a4.h` (Ascend entry point only).
 
 Reference: `tmp/nunchaku/src/kernels/zgemm/gemm_w4a4.cu:34-105`
 (nunchaku's host launcher — we omit the attention-fusion parameters
