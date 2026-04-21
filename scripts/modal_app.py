@@ -115,6 +115,11 @@ triton_image = (
         copy=False,
     )
     .add_local_file(
+        str(ROOT / "tmp" / "bench_gemm_v0.py"),
+        remote_path="/root/svdquant-kernels/tmp/bench_gemm_v0.py",
+        copy=False,
+    )
+    .add_local_file(
         str(ROOT / "tmp" / "bench_lora_saturation_prof.py"),
         remote_path="/root/svdquant-kernels/tmp/bench_lora_saturation_prof.py",
         copy=False,
@@ -188,6 +193,20 @@ def gemm_v0_smoke() -> None:
     subprocess.run(["nvidia-smi"], check=True)
     subprocess.run(
         ["python", "/root/svdquant-kernels/tmp/smoke_gemm_v0.py"], check=True
+    )
+
+
+@app.function(gpu="B200", image=triton_image, timeout=900)
+def gemm_v0_bench() -> None:
+    """gemm_w4a4 v0 latency sweep across ZImage shapes.
+
+    Baseline = fp16 torch.matmul, same (M, K, N). Reports t_ours /
+    t_fp16 and speedup. Used to tune the MMA tiler before v1 LoRA
+    interleave lands.
+    """
+    subprocess.run(["nvidia-smi"], check=True)
+    subprocess.run(
+        ["python", "/root/svdquant-kernels/tmp/bench_gemm_v0.py"], check=True
     )
 
 

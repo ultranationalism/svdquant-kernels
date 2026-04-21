@@ -48,10 +48,27 @@ from cutlass.cute.runtime import make_ptr                # noqa: E402
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait  # noqa: E402
 
 # --- config ---------------------------------------------------------------
-# v0: 1SM 128×128 MMA tile.  Promote to 128×256 or 2SM 256×256 in v2+ tune.
-# 128×128 → num_acc_stage = 2, no overlapping_accum branch. Simplest
-# correct first pass; plenty of room to tune once v1 (LoRA β) lands.
-_MMA_INST_MN: Tuple[int, int] = (128, 128)
+# v0 tune: two tilers, shape-adaptive.
+#   (128, 128): num_acc_stage = 2, more CTAs.
+#   (128, 256): num_acc_stage = 1 (auto by `_compute_stages`); 2× work
+#               per CTA, fewer CTAs.
+# Small M loses with 128×256: M=256 → 2 M-tiles × 12 N-tiles = 24 CTAs
+# vs 148 SMs ⇒ -31% TFLOPS. Large M wins +3–12% from less launch
+# overhead + longer MMA pipe run per CTA. Pick per-shape in `launch()`.
+# Compile cache keys on (tiler, dtype) so both tilers JIT once.
+# 2SM 256×256 is a later concern (needs cluster-aware barriers +
+# cta_group = TWO + overlapping_accum).
+_TILER_SMALL_M: Tuple[int, int] = (128, 128)
+_TILER_DEFAULT: Tuple[int, int] = (128, 256)
+# Empirically M ≤ 512 wants more CTAs over bigger tiles. Break-even
+# on B200 + ZImage shape set lies between 256 (-31% at 128×256) and
+# 4352 (+3–12%); no intermediate datapoint yet, so 512 is a guess
+# that covers the known bad case without downgrading the good ones.
+_TILER_SMALL_M_THRESHOLD: int = 512
+
+
+def _pick_tiler(M: int) -> Tuple[int, int]:
+    return _TILER_SMALL_M if M <= _TILER_SMALL_M_THRESHOLD else _TILER_DEFAULT
 _CLUSTER_SHAPE_MN: Tuple[int, int] = (1, 1)
 _SF_VEC_SIZE: int = 16                 # NVFP4 block size
 
@@ -66,8 +83,8 @@ def _check_inputs(
     ascales: torch.Tensor,
     wscales: torch.Tensor,
     out_dtype: torch.dtype,
-) -> Tuple[int, int, int]:
-    """Validate layout + dtype. Returns (M, N, K)."""
+) -> Tuple[int, int, int, Tuple[int, int]]:
+    """Validate layout + dtype. Returns (M, N, K, picked_tiler)."""
     assert act.is_cuda and wgt.is_cuda and ascales.is_cuda and wscales.is_cuda, \
         "all inputs must live on CUDA"
     assert act.dtype == torch.uint8 and wgt.dtype == torch.uint8, \
@@ -89,10 +106,11 @@ def _check_inputs(
     assert wscales.shape == (K_groups, N), \
         f"wscales shape {tuple(wscales.shape)} != ({K_groups}, {N})"
 
-    assert M % _MMA_INST_MN[0] == 0, f"M ({M}) must be a multiple of {_MMA_INST_MN[0]}"
-    assert N % _MMA_INST_MN[1] == 0, f"N ({N}) must be a multiple of {_MMA_INST_MN[1]}"
+    tiler = _pick_tiler(M)
+    assert M % tiler[0] == 0, f"M ({M}) must be a multiple of {tiler[0]} for tiler {tiler}"
+    assert N % tiler[1] == 0, f"N ({N}) must be a multiple of {tiler[1]} for tiler {tiler}"
     assert K % 32 == 0, f"K ({K}) must be a multiple of 32 for NVFP4 alignment"
-    return M, N, K
+    return M, N, K, tiler
 
 
 def _fp4_ptr(packed_uint8: torch.Tensor) -> "cute.Pointer":
@@ -167,13 +185,13 @@ def launch(
     out_dtype: torch.dtype = torch.float16,
 ) -> torch.Tensor:
     """v0: y = scaled_mma(act_nvfp4, wgt_nvfp4) — no LoRA, no affine."""
-    M, N, K = _check_inputs(act, wgt, ascales, wscales, out_dtype)
+    M, N, K, tiler = _check_inputs(act, wgt, ascales, wscales, out_dtype)
     out = torch.empty((M, N), dtype=out_dtype, device=act.device)
 
-    cache_key = (_cutlass_c_dtype(out_dtype), _MMA_INST_MN, _SF_VEC_SIZE, _CLUSTER_SHAPE_MN)
+    cache_key = (_cutlass_c_dtype(out_dtype), tiler, _SF_VEC_SIZE, _CLUSTER_SHAPE_MN)
     compiled = _COMPILED_CACHE.get(cache_key)
     if compiled is None:
-        compiled = _compile_v0(c_dtype=_cutlass_c_dtype(out_dtype))
+        compiled = _compile_v0(c_dtype=_cutlass_c_dtype(out_dtype), tiler_mn=tiler)
         _COMPILED_CACHE[cache_key] = compiled
 
     # Scale tensors arrive in nunchaku's K-major `[K/16, MN]` layout;
@@ -197,11 +215,15 @@ def launch(
 # --- JIT compile ----------------------------------------------------------
 
 
-def _compile_v0(*, c_dtype: Type[cutlass.Numeric]):
+def _compile_v0(
+    *,
+    c_dtype: Type[cutlass.Numeric],
+    tiler_mn: Tuple[int, int] = _TILER_DEFAULT,
+):
     """AOT-compile the v0 scaled-MMA kernel; shapes are runtime."""
     kernel_obj = Sm100GemmW4A4V0(
         sf_vec_size=_SF_VEC_SIZE,
-        mma_tiler_mn=_MMA_INST_MN,
+        mma_tiler_mn=tiler_mn,
         cluster_shape_mn=_CLUSTER_SHAPE_MN,
         ab_dtype=cutlass.Float4E2M1FN,
         sf_dtype=cutlass.Float8E4M3FN,
