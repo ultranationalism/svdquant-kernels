@@ -154,6 +154,21 @@ triton_image = (
         remote_path="/root/svdquant-kernels/tmp/bench_cutlass_nvfp4.py",
         copy=False,
     )
+    .add_local_file(
+        str(ROOT / "tmp" / "probe_hwinfo.py"),
+        remote_path="/root/svdquant-kernels/tmp/probe_hwinfo.py",
+        copy=False,
+    )
+    .add_local_file(
+        str(ROOT / "tmp" / "probe_launch.py"),
+        remote_path="/root/svdquant-kernels/tmp/probe_launch.py",
+        copy=False,
+    )
+    .add_local_file(
+        str(ROOT / "tmp" / "nsys_gemm.py"),
+        remote_path="/root/svdquant-kernels/tmp/nsys_gemm.py",
+        copy=False,
+    )
 )
 
 
@@ -308,6 +323,33 @@ def cutlass_nvfp4_bench() -> None:
     subprocess.run(["nvidia-smi"], check=True)
     subprocess.run(
         ["python", "/root/svdquant-kernels/tmp/bench_cutlass_nvfp4.py"], check=True
+    )
+
+
+@app.function(gpu="B200", image=triton_image, timeout=300)
+def nsys_gemm() -> None:
+    """Wall-time profile of a single gemm_w4a4 invocation via CUDA events."""
+    subprocess.run(["nvidia-smi"], check=True)
+    subprocess.run(
+        ["python", "/root/svdquant-kernels/tmp/nsys_gemm.py"], check=True
+    )
+
+
+@app.function(gpu="B200", image=triton_image, timeout=300)
+def probe_launch() -> None:
+    """Probe gemm_w4a4 launch — wall time + max_active_clusters via env debug."""
+    subprocess.run(["nvidia-smi"], check=True)
+    subprocess.run(
+        ["python", "/root/svdquant-kernels/tmp/probe_launch.py"], check=True
+    )
+
+
+@app.function(gpu="B200", image=triton_image, timeout=300)
+def probe_hwinfo() -> None:
+    """Probe cutlass.utils.HardwareInfo on B200 for max_active_clusters."""
+    subprocess.run(["nvidia-smi"], check=True)
+    subprocess.run(
+        ["python", "/root/svdquant-kernels/tmp/probe_hwinfo.py"], check=True
     )
 
 
