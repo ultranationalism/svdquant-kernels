@@ -115,6 +115,40 @@ def _sf_ptr(sf_uint8: torch.Tensor) -> "cute.Pointer":
     )
 
 
+def _repack_scales_cutlass_atom(scales_km: torch.Tensor) -> torch.Tensor:
+    """Repack `[K/16, M]` row-major scales (nunchaku convention) into the
+    CUTLASS `BlockScaledBasicChunk` atom-tiled layout.
+
+    The K-major basic chunk at `blockscaled_layout.py` declares
+    stride `((16, 4), (0, 1))` over `((32, 4), (sf_vec_size, 4))`, meaning
+    inside each 128-M × 4-K_group chunk the fastest-to-slowest storage
+    dims are: `k_inner` (stride 1), `m_mid` (stride 4), `m_inner` (stride
+    16). `tile_to_shape(chunk, (M, K, L), order=(2, 1, 3))` then extends
+    with outer `(rest_m, rest_k, L)` tiles.
+
+    Result: contiguous 6-D tensor with shape
+    `(L, rest_m, rest_k, m_inner=32, m_mid=4, k_inner=4)` where the
+    logical (m, k_group) at position (`m_outer*128 + m_mid*32 + m_inner`,
+    `k_outer*4 + k_inner`) maps to `[0, m_outer, k_outer, m_inner, m_mid,
+    k_inner]`.  Returns the tensor (caller grabs data_ptr).
+
+    Copy happens on-device; scales are tiny (K/16 × M fp8 bytes, << act
+    payload) so this is in the noise for bench.
+    """
+    sfk, M = scales_km.shape
+    assert M % 128 == 0, f"CUTLASS SF atom: M ({M}) must be a multiple of 128"
+    assert sfk % 4 == 0, f"CUTLASS SF atom: K/16 ({sfk}) must be a multiple of 4"
+    rest_m = M // 128
+    rest_k = sfk // 4
+    # [K/16, M] → [M, K/16]
+    mk = scales_km.T.contiguous()
+    # Split: M = (rest_m, m_mid=4, m_inner=32)  K/16 = (rest_k, k_inner=4)
+    # Storage order: (rest_m, rest_k, m_inner, m_mid, k_inner)
+    mk5 = mk.reshape(rest_m, 4, 32, rest_k, 4)         # (rm, mmid, minn, rk, kinn)
+    storage = mk5.permute(0, 3, 2, 1, 4).contiguous()  # (rm, rk, minn, mmid, kinn)
+    return storage.unsqueeze(0)                        # L=1 front
+
+
 def _c_ptr(out: torch.Tensor) -> "cute.Pointer":
     dtype = {torch.float16: cutlass.Float16, torch.bfloat16: cutlass.BFloat16}[out.dtype]
     return make_ptr(dtype, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
@@ -142,12 +176,17 @@ def launch(
         compiled = _compile_v0(c_dtype=_cutlass_c_dtype(out_dtype))
         _COMPILED_CACHE[cache_key] = compiled
 
+    # Scale tensors arrive in nunchaku's K-major `[K/16, MN]` layout;
+    # repack to CUTLASS's BlockScaled SF atom layout before handing off.
+    ascales_atom = _repack_scales_cutlass_atom(ascales)
+    wscales_atom = _repack_scales_cutlass_atom(wscales)
+
     stream = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
     compiled(
         _fp4_ptr(act),
         _fp4_ptr(wgt),
-        _sf_ptr(ascales),
-        _sf_ptr(wscales),
+        _sf_ptr(ascales_atom),
+        _sf_ptr(wscales_atom),
         _c_ptr(out),
         (cutlass.Int32(M), cutlass.Int32(N), cutlass.Int32(K), cutlass.Int32(1)),
         stream,
