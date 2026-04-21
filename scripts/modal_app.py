@@ -144,6 +144,16 @@ triton_image = (
         remote_path="/root/svdquant-kernels/tmp/bench_lora_saturation_prof.py",
         copy=False,
     )
+    .add_local_file(
+        str(ROOT / "tmp" / "cutlass_bs_gemm_persistent.py"),
+        remote_path="/root/svdquant-kernels/tmp/cutlass_bs_gemm_persistent.py",
+        copy=False,
+    )
+    .add_local_file(
+        str(ROOT / "tmp" / "bench_cutlass_nvfp4.py"),
+        remote_path="/root/svdquant-kernels/tmp/bench_cutlass_nvfp4.py",
+        copy=False,
+    )
 )
 
 
@@ -284,6 +294,20 @@ def gemm_bench() -> None:
     subprocess.run(["nvidia-smi"], check=True)
     subprocess.run(
         ["python", "/root/svdquant-kernels/tmp/bench_gemm.py"], check=True
+    )
+
+
+@app.function(gpu="B200", image=triton_image, timeout=1800)
+def cutlass_nvfp4_bench() -> None:
+    """CUTLASS NVFP4 persistent GEMM vs our gemm_w4a4, same shapes + B200.
+
+    Baseline for MFU discussion. CUTLASS example (no LoRA, no epilogue
+    scale/bias) measures what NVFP4 can actually do on this hardware;
+    we compare v0 1-CTA and 2-CTA Phase 1 at the same shapes.
+    """
+    subprocess.run(["nvidia-smi"], check=True)
+    subprocess.run(
+        ["python", "/root/svdquant-kernels/tmp/bench_cutlass_nvfp4.py"], check=True
     )
 
 
