@@ -293,15 +293,81 @@ from the load warp (lane 0, CTAs 0/1/2):
 
 → num_n=2 inside the kernel. Root cause located.
 
+## Bug 4 — 2-CTA m_tile unit mismatch (fixed)
+
+After Bug 3: 1-CTA was green, but 2-CTA M=4352 shapes kept failing
+(nan on K=3840, rel≈1 on K=10240/15360). M=256 2-CTA passed only
+because it has `num_m_cluster=1` and never exercised the
+multi-cluster decoder path.
+
+**Root cause**: inside the kernel body, `gC_mnl` is tiled by
+`mma_tiler` (256×128 under 2-CTA), so `gC_mnl.num_m = M / 256 = 17`
+for M=4352. `thr_mma.partition_C(gC_mnl)` further slices the V axis
+so each CTA in a 2-CTA pair owns rows 0–127 / 128–255 of each mma
+tile automatically — both CTAs in a cluster must therefore use the
+**same** `m_tile` value (= m_cluster, in mma-tile units).
+
+The persistent decoder was instead computing:
+
+```python
+m_tile = m_cluster * cluster_m + block_in_cluster_coord_vmnk[2]
+```
+
+Two independent mistakes:
+
+1. `cluster_m` was applied at the wrong level. `m_cluster` is
+   already in mma-tile units, not cta-tile units; multiplying by
+   `cluster_m` turns a valid `[0, 17)` index into `{0, 2, …, 32}`
+   — 9 of the 17 mma tiles never covered, 8 out-of-range writes.
+2. `block_in_cluster_coord_vmnk[2]` is the **N axis** of
+   `cluster_layout_vmnk` (shape `((2,), 1, 1, 1)` for cluster
+   (2,1) + atom `CtaGroup.TWO`), which is always 0 under (2,1).
+   The per-CTA M offset lives on index `[0]` (V), not `[2]`.
+
+Even if the intent had been "cta-tile-unit m + V offset", the
+indexing target (`gC_mnl`) is in mma-tile units, so that scheme
+is also wrong.
+
+**Reference**: `kernel.py` (non-persistent 2-CTA, working) uses
+`mma_tile_coord_mnl[0] = bidx // atom_thr_size` — both CTAs in the
+pair share the same `[0]` and rely on `partition_C` for V.
+
+**Fix**: drop the V offset and the `cluster_m` multiplier. Also
+compute `num_m_cluster` by dividing the C tensor by `mma_tiler`
+directly (not `cta_tile_shape_mnk` followed by `// cluster_m`) so
+the host grid count and device `gC_mnl.num_m` use the same
+tiler.
+
+```python
+_c_tile = cute.slice_(self.mma_tiler, (None, None, 0))
+_gc_zipped = cute.zipped_divide(mC_mnl, tiler=_c_tile)
+num_m_cluster, num_n, num_l = _gc_zipped[(0, (None, None, None))].shape
+...
+m_tile = mn_rem // num_n    # mma-tile units, shared by both CTAs
+n_tile = mn_rem % num_n
+```
+
+For 1-CTA, `mma_tiler == cta_tile_shape_mnk` so `num_m_cluster ==
+num_m_cta`; the old decoder's `m_cluster*1 + 0` and the new
+`m_cluster` are numerically identical — 1-CTA stayed bit-exact
+under the rewrite.
+
+**Trace-level confirmation** (runs on any box with cutlass-dsl,
+no B200 needed):
+
+- `tmp/trace_cluster_layout.py` — shows `cluster_layout_vmnk =
+  ((2,), 1, 1, 1)`, so `[2]` = 0 always under cluster (2,1).
+- `tmp/trace_gc_mnl_2cta.py` — shows `gC_mnl.shape =
+  (256, 128, 17, 24, 1)` for M=4352; `num_m_cta` from cta-tile
+  divide = 34 = 2× the mma count.
+
 ## Result
 
 1-CTA path: **12/12 shapes pass** (was 0/12). rel = 0.00e+00 on all
 shapes — bit-exact vs fp32 dequant ref.
 
-2-CTA path: M=256 passes (1 cluster); M=4352 shapes still fail. That
-is a separate bug (cross-cluster persistent scheduling) — tracked
-separately. The 1-CTA correctness is the main proof point for the
-FA4-pattern rewrite.
+2-CTA path: **12/12 shapes pass** (was 2/12 after Bug 3 — only the
+M=256 single-cluster shapes). rel = 0.00e+00 on all shapes.
 
 ## Lessons
 
@@ -314,6 +380,18 @@ FA4-pattern rewrite.
   runs on the device from a flat tile index. Host-side grid computation
   (which used `zipped_divide`) was correct; the device-side decode
   was off by one on every index and got silently wrong values.
+- Under 2-CTA `CtaGroup.TWO`, the **per-CTA M-within-cluster
+  position** lives on `cluster_layout_vmnk`'s `V` axis (index 0),
+  not `M` / `N` (indices 1/2). V = atom_thr_shape for tcgen05 2-CTA;
+  the residual M axis collapses to 1 whenever `cluster_m ==
+  atom_thr_size`. Always cross-check by tracing
+  `cluster_layout_vmnk.shape` before reading it positionally — same
+  class of positional-indexing trap as Bug 3.
+- When tiling C / AB tensors, pick the tiler that matches the
+  consumer's expected coord granularity. Under 2-CTA that is
+  `mma_tiler` (cluster-wide M), **not** `cta_tile_shape_mnk`;
+  `partition_C` / `partition_A` / `partition_B` handle the V split
+  for you.
 - `cute.printf` bisect — three rounds, each narrowing by one order of
   magnitude — took the bug from "epi is broken" (wrong) to "MMA on
   tile 2 is broken" to "scheduler misdecodes tile 2". Worth keeping

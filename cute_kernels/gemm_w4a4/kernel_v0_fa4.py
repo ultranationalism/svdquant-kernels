@@ -360,15 +360,14 @@ class Sm100GemmW4A4V0FA4:
 
         `total_tiles_cluster` counts clusters (M_tiles / cluster_m × N_tiles ×
         L), not individual CTAs — the advance stride is `cluster_dim`
-        under 2-CTA, so the while-condition compares cluster indices."""
-        c_shape = cute.slice_(self.cta_tile_shape_mnk, (None, None, 0))
-        gc = cute.zipped_divide(c_tensor, tiler=c_shape)
-        num_ctas_mnl = gc[(0, (None, None, None))].shape
-        num_m_cta, num_n, num_l = num_ctas_mnl
-        # cluster_m tiles per M-cluster.
-        cluster_m = self.cluster_shape_mn[0]
-        num_m_cluster = (num_m_cta + cluster_m - 1) // cluster_m
+        under 2-CTA, so the while-condition compares cluster indices.
+        Tile by `mma_tiler` (spans the whole cluster in M) so the count
+        matches the device-side `gC_mnl.num_m`."""
+        mma_c_shape = cute.slice_(self.mma_tiler, (None, None, 0))
+        gc = cute.zipped_divide(c_tensor, tiler=mma_c_shape)
+        num_m_cluster, num_n, num_l = gc[(0, (None, None, None))].shape
         total_tiles_cluster = num_m_cluster * num_n * num_l
+        cluster_m = self.cluster_shape_mn[0]
         hw = utils.HardwareInfo()
         sm_count = hw.get_device_multiprocessor_count()
         max_ctas = (sm_count // cluster_m) * cluster_m
@@ -700,20 +699,24 @@ class Sm100GemmW4A4V0FA4:
 
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
-        # Derived shape info for the tile index → (m_tile, n_tile, l_tile)
-        # decode. Use `zipped_divide` because it gives a nested shape
-        # `((tile_m, tile_n), (num_m, num_n, num_l))` whose second mode
-        # is exactly the coord tuple we need. `local_tile` (and
-        # `flat_divide`) return a *flat* shape
-        # `(tile_m, tile_n, num_m, num_n, num_l)` — the straightforward-
-        # looking `gC_mnl.shape[1]` is then `tile_n = 128`, not
-        # `num_m_cta = 2`, off by one on every subsequent index. That
-        # silently misroutes every `tile_idx >= num_m_cta`.
-        _c_tile = cute.slice_(self.cta_tile_shape_mnk, (None, None, 0))
+        # Per-MMA-tile count for the `tile_idx → (m_tile, n_tile, l_tile)`
+        # decode. `gC_mnl` below is tiled by `mma_tiler` (= 256×128 under
+        # 2-CTA), so its `num_m` axis counts *mma tiles*, not cta tiles;
+        # each mma tile spans both CTAs in a 2-CTA cluster and
+        # `partition_C` on the mma slot already hands each CTA its half.
+        # Both CTAs in a cluster therefore use the **same** `m_tile`.
+        #
+        # Two divide-API traps rolled into one. (1) `local_tile.shape` is
+        # flat `(tile_m, tile_n, num_m, num_n, num_l)`, not nested — use
+        # `zipped_divide` and unpack the second mode for positional coord
+        # access. (2) Tile by `mma_tiler[0]`, not `cta_tile_shape_mnk[0]`:
+        # an earlier version divided by cta-tile (128) and added a V
+        # offset to `m_tile`, which fired 2× out-of-range indices on any
+        # 2-CTA shape with `num_m_cluster > 1` (= any shape beyond the
+        # single-cluster M=256 smoke).
+        _c_tile = cute.slice_(self.mma_tiler, (None, None, 0))
         _gc_zipped = cute.zipped_divide(mC_mnl, tiler=_c_tile)
-        num_m_cta, num_n, num_l = _gc_zipped[(0, (None, None, None))].shape
-        cluster_m = self.cluster_shape_mn[0]
-        num_m_cluster = num_m_cta // cluster_m
+        num_m_cluster, num_n, num_l = _gc_zipped[(0, (None, None, None))].shape
         tiles_per_l = num_m_cluster * num_n
 
         # =========================================================
@@ -728,9 +731,8 @@ class Sm100GemmW4A4V0FA4:
             while tile_idx < total_tiles_cluster:
                 l_tile = tile_idx // tiles_per_l
                 mn_rem = tile_idx % tiles_per_l
-                m_cluster = mn_rem // num_n
+                m_tile = mn_rem // num_n
                 n_tile = mn_rem % num_n
-                m_tile = m_cluster * cluster_m + block_in_cluster_coord_vmnk[2]
 
                 tAgA_slice = tAgA[(None, m_tile, None, l_tile)]
                 tBgB_slice = tBgB[(None, n_tile, None, l_tile)]
@@ -937,9 +939,8 @@ class Sm100GemmW4A4V0FA4:
             while tile_idx < total_tiles_cluster:
                 l_tile = tile_idx // tiles_per_l
                 mn_rem = tile_idx % tiles_per_l
-                m_cluster = mn_rem // num_n
+                m_tile = mn_rem // num_n
                 n_tile = mn_rem % num_n
-                m_tile = m_cluster * cluster_m + block_in_cluster_coord_vmnk[2]
 
                 bSG_gC = bSG_gC_partitioned[(None, None, None, m_tile, n_tile, l_tile)]
                 bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
