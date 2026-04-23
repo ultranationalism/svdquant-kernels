@@ -86,6 +86,12 @@ is just a known-good toolset we borrow.
 - **Scratch artifacts go in `tmp/`** (gitignored): trace dumps pulled
   back from remote, generated sources, one-off scripts, staging
   tarballs. Don't pollute the repo root.
+- **Command / bench / smoke output goes in `log/`** (gitignored):
+  `modal run ... 2>&1 | tee log/<task>.log`, `nvidia-smi` dumps, nsys
+  reports, anything textual you want to eyeball. Keep `tmp/` for
+  *source-like* scratch (scripts, traces) and `log/` for *output*.
+  Cross-reference by filename (e.g., `tmp/bench_gemm_v0.py` →
+  `log/bench_gemm_v0.log`).
 
 ## What this repo is (and isn't)
 

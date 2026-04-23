@@ -24,3 +24,5 @@ CMakeCache.txt
 CMakeFiles/
 tmp/*
 !tmp/.gitkeep
+log/*
+!log/.gitkeep
