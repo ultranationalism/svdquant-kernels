@@ -58,9 +58,9 @@ from cutlass.pipeline import (                           # noqa: E402
 )
 
 from cute_kernels.gemm_w4a4.kernel import (              # noqa: E402
-    _SF_VEC_SIZE,
+    _SF_VEC_SIZE, _LORA_INST_K,
     _TILER_SMALL_M, _TILER_DEFAULT, _TILER_2CTA, _TILER_SMALL_M_THRESHOLD,
-    _check_inputs, _fp4_ptr, _sf_ptr, _c_ptr,
+    _check_inputs, _fp4_ptr, _sf_ptr, _c_ptr, _lora_ptr,
     _repack_scales_cutlass_atom, _cutlass_c_dtype,
 )
 from cute_kernels.gemm_w4a4._pipeline_simple import (    # noqa: E402
@@ -79,9 +79,15 @@ _COMPILED_CACHE: dict[tuple, object] = {}
 # K·N — net not worth making default. Opt-in via `launch_v0(tiler_mn=
 # (256, 256))`. The dominant MFU gap vs CUTLASS (~20pp at matched
 # tile) is elsewhere (pipeline discipline / TMA / s2t) — task #41.
-def _pick_tiler_v0(M: int, use_2cta: bool) -> Tuple[int, int]:
+def _pick_tiler_v0(M: int, use_2cta: bool, R: int = 0) -> Tuple[int, int]:
     if use_2cta:
         return _TILER_2CTA
+    # v1: high-R LoRA smem (LA + LU) overflows 228 KB at tile 128×256
+    # (LU alone = 128 KB at R=256). Fall back to 128×128 on R ≥ 256 so
+    # LU halves to 64 KB. Mirrors kernel.py::_pick_tiler; production
+    # R ≤ 128 so this only fires on the stress-test shape.
+    if R >= 256:
+        return _TILER_SMALL_M
     return _TILER_SMALL_M if M <= _TILER_SMALL_M_THRESHOLD else _TILER_DEFAULT
 
 
@@ -90,31 +96,39 @@ def launch_v0(
     wgt: torch.Tensor,
     ascales: torch.Tensor,
     wscales: torch.Tensor,
+    lora_act_in: "torch.Tensor | None" = None,
+    lora_up: "torch.Tensor | None" = None,
     *,
     out_dtype: torch.dtype = torch.float16,
     use_2cta: bool = False,
     tiler_mn: Tuple[int, int] | None = None,
 ) -> torch.Tensor:
-    """y = scaled_mma(act_nvfp4, wgt_nvfp4). No LoRA, no affine.
+    """v0: y = scaled_mma(act_nvfp4, wgt_nvfp4). No LoRA, no affine.
+    v1 (both lora_* provided): y += lora_act_in @ lora_up.T, β-interleaved
+    into the main K-loop per design §2.
 
     `tiler_mn` overrides the shape-adaptive pick — bench hook, do not use
     in production paths (no validation against smem / tmem budgets)."""
     M, N, K, R, _ = _check_inputs(
         act, wgt, ascales, wscales, out_dtype,
-        lora_act_in=None, lora_up=None, use_2cta=use_2cta,
+        lora_act_in=lora_act_in, lora_up=lora_up, use_2cta=use_2cta,
     )
-    assert R == 0, "v0 does not support LoRA"
-    tiler = tiler_mn if tiler_mn is not None else _pick_tiler_v0(M, use_2cta)
+    enable_lora = lora_act_in is not None
+    tiler = tiler_mn if tiler_mn is not None else _pick_tiler_v0(M, use_2cta, R)
     assert M % tiler[0] == 0 and N % tiler[1] == 0
     cluster_shape_mn = (2, 1) if use_2cta else (1, 1)
     out = torch.empty((M, N), dtype=out_dtype, device=act.device)
 
-    cache_key = (_cutlass_c_dtype(out_dtype), tiler, _SF_VEC_SIZE, cluster_shape_mn)
+    cache_key = (
+        _cutlass_c_dtype(out_dtype), tiler, _SF_VEC_SIZE, cluster_shape_mn,
+        enable_lora, R,
+    )
     compiled = _COMPILED_CACHE.get(cache_key)
     if compiled is None:
         compiled = _compile_v0(
             c_dtype=_cutlass_c_dtype(out_dtype), tiler_mn=tiler,
             cluster_shape_mn=cluster_shape_mn,
+            enable_lora=enable_lora, R=R,
         )
         _COMPILED_CACHE[cache_key] = compiled
 
@@ -122,11 +136,30 @@ def launch_v0(
     wscales_atom = _repack_scales_cutlass_atom(wscales)
 
     stream = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
+    # LoRA host prep: lora_act_in may arrive fp32; dense MMA atom reads
+    # fp16/bf16 from smem, so pre-cast at the boundary (≤ M·R·4 B, sub-µs
+    # for R ≤ 128). Kept for parity with kernel.py; revisit if load warp
+    # becomes bottleneck.
+    if enable_lora:
+        la_cast = (
+            lora_act_in.to(out_dtype).contiguous()
+            if lora_act_in.dtype != out_dtype
+            else lora_act_in.contiguous()
+        )
+        lu_cast = lora_up.contiguous()
+        la_ptr = _lora_ptr(la_cast)
+        lu_ptr = _lora_ptr(lu_cast)
+    else:
+        la_ptr = make_ptr(
+            _cutlass_c_dtype(out_dtype), 0, cute.AddressSpace.gmem, assumed_align=16)
+        lu_ptr = make_ptr(
+            _cutlass_c_dtype(out_dtype), 0, cute.AddressSpace.gmem, assumed_align=16)
     compiled(
         _fp4_ptr(act),
         _fp4_ptr(wgt),
         _sf_ptr(ascales_atom),
         _sf_ptr(wscales_atom),
+        la_ptr, lu_ptr,
         _c_ptr(out),
         (cutlass.Int32(M), cutlass.Int32(N), cutlass.Int32(K), cutlass.Int32(1)),
         stream,
@@ -139,6 +172,8 @@ def _compile_v0(
     c_dtype: Type[cutlass.Numeric],
     tiler_mn: Tuple[int, int],
     cluster_shape_mn: Tuple[int, int],
+    enable_lora: bool = False,
+    R: int = 0,
 ):
     kernel_obj = Sm100GemmW4A4V0FA4(
         sf_vec_size=_SF_VEC_SIZE,
@@ -147,17 +182,21 @@ def _compile_v0(
         ab_dtype=cutlass.Float4E2M1FN,
         sf_dtype=cutlass.Float8E4M3FN,
         c_dtype=c_dtype,
+        enable_lora=enable_lora,
+        R=R,
     )
     a_ptr = make_ptr(cutlass.Float4E2M1FN, 0, cute.AddressSpace.gmem, assumed_align=32)
     b_ptr = make_ptr(cutlass.Float4E2M1FN, 0, cute.AddressSpace.gmem, assumed_align=32)
     sfa_ptr = make_ptr(cutlass.Float8E4M3FN, 0, cute.AddressSpace.gmem, assumed_align=16)
     sfb_ptr = make_ptr(cutlass.Float8E4M3FN, 0, cute.AddressSpace.gmem, assumed_align=16)
+    la_ptr = make_ptr(c_dtype, 0, cute.AddressSpace.gmem, assumed_align=16)
+    lu_ptr = make_ptr(c_dtype, 0, cute.AddressSpace.gmem, assumed_align=16)
     c_ptr = make_ptr(c_dtype, 0, cute.AddressSpace.gmem, assumed_align=16)
     dummy_stream = cuda_drv.CUstream(0)
 
     return cute.compile(
         kernel_obj,
-        a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr,
+        a_ptr, b_ptr, sfa_ptr, sfb_ptr, la_ptr, lu_ptr, c_ptr,
         (cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0)),
         dummy_stream,
     )
@@ -186,6 +225,8 @@ class Sm100GemmW4A4V0FA4:
         ab_dtype: Type[cutlass.Numeric],
         sf_dtype: Type[cutlass.Numeric],
         c_dtype: Type[cutlass.Numeric],
+        enable_lora: bool = False,
+        R: int = 0,
     ):
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
@@ -210,6 +251,20 @@ class Sm100GemmW4A4V0FA4:
         self.ab_dtype = ab_dtype
         self.sf_dtype = sf_dtype
         self.c_dtype = c_dtype
+        # LoRA config: R = 0 disables v1 path. R_atoms = R // 16 (dense
+        # tcgen05 fp16/bf16 K-instr). Baked compile-time so the LoRA
+        # atom loop can unroll_full. 2-CTA LoRA TV-layout match verified
+        # via tmp/verify_tmem_layout.py (shared-tmem acc viable).
+        self.enable_lora = enable_lora
+        self.R = R
+        if enable_lora:
+            assert R > 0 and R % _LORA_INST_K == 0, \
+                f"LoRA R ({R}) must be a positive multiple of {_LORA_INST_K}"
+            self.R_atoms = R // _LORA_INST_K
+            self.lora_ab_dtype = c_dtype   # LA/LU stored at output dtype
+        else:
+            self.R_atoms = 0
+            self.lora_ab_dtype = None
         self.a_major_mode = tcgen05.OperandMajorMode.K
         self.b_major_mode = tcgen05.OperandMajorMode.K
         self.c_layout = utils.LayoutEnum.ROW_MAJOR
@@ -291,11 +346,20 @@ class Sm100GemmW4A4V0FA4:
         )
         self.epi_tile_n = cute.size(self.epi_tile[1])
 
+        # LoRA smem (LA + LU, single-buffer) deducted from budget so
+        # num_ab_stage shrinks. LA = [M, R] * dtype bytes, LU = [N, R] * dtype bytes.
+        lora_smem_bytes = 0
+        if cutlass.const_expr(self.enable_lora):
+            la_bytes = (self.mma_inst_shape_mn[0] * self.R
+                        * self.lora_ab_dtype.width // 8)
+            lu_bytes = (self.mma_inst_shape_mn[1] * self.R
+                        * self.lora_ab_dtype.width // 8)
+            lora_smem_bytes = la_bytes + lu_bytes
         self.num_acc_stage, self.num_ab_stage, self.num_c_stage = self._compute_stages(
             tiled_mma, self.mma_tiler, self.ab_dtype, self.ab_dtype,
             self.epi_tile, self.c_dtype, self.c_layout,
             self.sf_dtype, self.sf_vec_size,
-            self.smem_capacity, self.occupancy,
+            self.smem_capacity - lora_smem_bytes, self.occupancy,
         )
         assert self.num_ab_stage >= 2, \
             f"num_ab_stage = {self.num_ab_stage} — smem budget too tight"
@@ -323,7 +387,40 @@ class Sm100GemmW4A4V0FA4:
             self.cta_tile_shape_mnk[1] * self.num_acc_stage
         )
 
-        return tiled_mma, tiled_mma_sfb
+        # LoRA dense MMA atom + LA/LU staged smem layouts. Shared-tmem acc:
+        # LoRA MMA's partition_C writes to the same tmem region as main —
+        # TV-layout match verified under 2-CTA via tmp/verify_tmem_layout.py.
+        tiled_mma_lora = None
+        if cutlass.const_expr(self.enable_lora):
+            tiled_mma_lora = sm100_utils.make_trivial_tiled_mma(
+                ab_dtype=self.lora_ab_dtype,
+                a_leading_mode=self.a_major_mode,
+                b_leading_mode=self.b_major_mode,
+                acc_dtype=self.acc_dtype,
+                cta_group=self.cta_group,
+                mma_tiler_mn=self.mma_inst_shape_mn,
+            )
+            lora_inst_shape_k = cute.size(tiled_mma_lora.shape_mnk, mode=[2])
+            assert lora_inst_shape_k == _LORA_INST_K, (
+                f"LoRA dense MMA shape_mnk[2] ({lora_inst_shape_k}) != "
+                f"expected _LORA_INST_K ({_LORA_INST_K}). Check Blackwell "
+                f"dense tcgen05 for dtype {self.lora_ab_dtype}.")
+            self.lora_mma_tiler = (
+                self.mma_inst_shape_mn[0],
+                self.mma_inst_shape_mn[1],
+                self.R,
+            )
+            self.num_lora_stage = 1   # single-buffer prolog (README §Pipelines)
+            self.la_smem_layout_staged = sm100_utils.make_smem_layout_a(
+                tiled_mma_lora, self.lora_mma_tiler, self.lora_ab_dtype,
+                self.num_lora_stage,
+            )
+            self.lu_smem_layout_staged = sm100_utils.make_smem_layout_b(
+                tiled_mma_lora, self.lora_mma_tiler, self.lora_ab_dtype,
+                self.num_lora_stage,
+            )
+
+        return tiled_mma, tiled_mma_sfb, tiled_mma_lora
 
     @staticmethod
     def _compute_stages(
@@ -395,6 +492,8 @@ class Sm100GemmW4A4V0FA4:
         b_ptr: cute.Pointer,
         sfa_ptr: cute.Pointer,
         sfb_ptr: cute.Pointer,
+        la_ptr: cute.Pointer,
+        lu_ptr: cute.Pointer,
         c_ptr: cute.Pointer,
         problem_mnkl: Tuple[Int32, Int32, Int32, Int32],
         stream,
@@ -420,7 +519,7 @@ class Sm100GemmW4A4V0FA4:
             blockscaled_utils.tile_atom_to_shape_SF(b_tensor.shape, self.sf_vec_size),
         )
 
-        tiled_mma, tiled_mma_sfb = self._setup_attributes()
+        tiled_mma, tiled_mma_sfb, tiled_mma_lora = self._setup_attributes()
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
 
         a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0))
@@ -461,6 +560,44 @@ class Sm100GemmW4A4V0FA4:
             + cute.size_in_bytes(self.sf_dtype, sfb_smem_layout)
         ) * atom_thr_size
 
+        # LoRA TMA atoms (when enabled). LA = [M, R] K-major, LU = [N, R]
+        # K-major; L=1, K=R (baked compile-time). Partitioned via
+        # tiled_mma_lora so acc fragment TV-layout matches main. Tx_count
+        # carries the same ×cta_group_size multiplier as main A/B.
+        tma_atom_la = None
+        tma_tensor_la = None
+        tma_atom_lu = None
+        tma_tensor_lu = None
+        num_lora_tma_bytes = 0
+        if cutlass.const_expr(self.enable_lora):
+            la_layout = cute.make_ordered_layout(
+                (cute.assume(m, 32), self.R, l), order=(1, 0, 2))
+            lu_layout = cute.make_ordered_layout(
+                (cute.assume(n, 32), self.R, l), order=(1, 0, 2))
+            la_tensor = cute.make_tensor(la_ptr, la_layout)
+            lu_tensor = cute.make_tensor(lu_ptr, lu_layout)
+            la_smem_layout = cute.slice_(
+                self.la_smem_layout_staged, (None, None, None, 0))
+            lu_smem_layout = cute.slice_(
+                self.lu_smem_layout_staged, (None, None, None, 0))
+            tma_atom_la, tma_tensor_la = cute.nvgpu.make_tiled_tma_atom_A(
+                sm100_utils.cluster_shape_to_tma_atom_A(
+                    self.cluster_shape_mn, tiled_mma_lora.thr_id),
+                la_tensor, la_smem_layout, self.lora_mma_tiler, tiled_mma_lora,
+                self.cluster_layout_vmnk.shape,
+            )
+            tma_atom_lu, tma_tensor_lu = cute.nvgpu.make_tiled_tma_atom_B(
+                sm100_utils.cluster_shape_to_tma_atom_B(
+                    self.cluster_shape_mn, tiled_mma_lora.thr_id),
+                lu_tensor, lu_smem_layout, self.lora_mma_tiler, tiled_mma_lora,
+                self.cluster_layout_vmnk.shape,
+            )
+            num_lora_tma_bytes = (
+                cute.size_in_bytes(self.lora_ab_dtype, la_smem_layout)
+                + cute.size_in_bytes(self.lora_ab_dtype, lu_smem_layout)
+            ) * atom_thr_size
+        self.num_lora_tma_bytes = num_lora_tma_bytes
+
         epi_smem_layout = cute.slice_(self.c_smem_layout_staged, (None, None, 0))
         tma_atom_c, tma_tensor_c = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileS2GOp(),
@@ -470,47 +607,102 @@ class Sm100GemmW4A4V0FA4:
         grid_x, grid_y, grid_z, total_tiles_cluster = \
             self._compute_grid_persistent(c_tensor)
 
-        @cute.struct
-        class SharedStorage:
-            ab_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage]
-            ab_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage]
-            acc_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
-            acc_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
-            tmem_dealloc_mbar: cutlass.Int64
-            tmem_holding_buf: cutlass.Int32
-            sC: cute.struct.Align[
-                cute.struct.MemRange[self.c_dtype, cute.cosize(self.c_smem_layout_staged.outer)],
-                self.buffer_align_bytes,
-            ]
-            sA: cute.struct.Align[
-                cute.struct.MemRange[self.ab_dtype, cute.cosize(self.a_smem_layout_staged.outer)],
-                self.buffer_align_bytes,
-            ]
-            sB: cute.struct.Align[
-                cute.struct.MemRange[self.ab_dtype, cute.cosize(self.b_smem_layout_staged.outer)],
-                self.buffer_align_bytes,
-            ]
-            sSFA: cute.struct.Align[
-                cute.struct.MemRange[self.sf_dtype, cute.cosize(self.sfa_smem_layout_staged)],
-                self.buffer_align_bytes,
-            ]
-            sSFB: cute.struct.Align[
-                cute.struct.MemRange[self.sf_dtype, cute.cosize(self.sfb_smem_layout_staged)],
-                self.buffer_align_bytes,
-            ]
+        # SharedStorage. LoRA fields conditional; CuTe DSL builds the
+        # struct body at trace time so fields only materialize when
+        # enable_lora. Mirrors kernel.py:798-867.
+        if cutlass.const_expr(self.enable_lora):
+            @cute.struct
+            class SharedStorage:
+                ab_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage]
+                ab_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage]
+                acc_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
+                acc_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
+                lora_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_lora_stage]
+                lora_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_lora_stage]
+                tmem_dealloc_mbar: cutlass.Int64
+                tmem_holding_buf: cutlass.Int32
+                sC: cute.struct.Align[
+                    cute.struct.MemRange[self.c_dtype, cute.cosize(self.c_smem_layout_staged.outer)],
+                    self.buffer_align_bytes,
+                ]
+                sA: cute.struct.Align[
+                    cute.struct.MemRange[self.ab_dtype, cute.cosize(self.a_smem_layout_staged.outer)],
+                    self.buffer_align_bytes,
+                ]
+                sB: cute.struct.Align[
+                    cute.struct.MemRange[self.ab_dtype, cute.cosize(self.b_smem_layout_staged.outer)],
+                    self.buffer_align_bytes,
+                ]
+                sSFA: cute.struct.Align[
+                    cute.struct.MemRange[self.sf_dtype, cute.cosize(self.sfa_smem_layout_staged)],
+                    self.buffer_align_bytes,
+                ]
+                sSFB: cute.struct.Align[
+                    cute.struct.MemRange[self.sf_dtype, cute.cosize(self.sfb_smem_layout_staged)],
+                    self.buffer_align_bytes,
+                ]
+                sLA: cute.struct.Align[
+                    cute.struct.MemRange[self.lora_ab_dtype,
+                                         cute.cosize(self.la_smem_layout_staged.outer)],
+                    self.buffer_align_bytes,
+                ]
+                sLU: cute.struct.Align[
+                    cute.struct.MemRange[self.lora_ab_dtype,
+                                         cute.cosize(self.lu_smem_layout_staged.outer)],
+                    self.buffer_align_bytes,
+                ]
+        else:
+            @cute.struct
+            class SharedStorage:
+                ab_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage]
+                ab_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage]
+                acc_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
+                acc_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
+                tmem_dealloc_mbar: cutlass.Int64
+                tmem_holding_buf: cutlass.Int32
+                sC: cute.struct.Align[
+                    cute.struct.MemRange[self.c_dtype, cute.cosize(self.c_smem_layout_staged.outer)],
+                    self.buffer_align_bytes,
+                ]
+                sA: cute.struct.Align[
+                    cute.struct.MemRange[self.ab_dtype, cute.cosize(self.a_smem_layout_staged.outer)],
+                    self.buffer_align_bytes,
+                ]
+                sB: cute.struct.Align[
+                    cute.struct.MemRange[self.ab_dtype, cute.cosize(self.b_smem_layout_staged.outer)],
+                    self.buffer_align_bytes,
+                ]
+                sSFA: cute.struct.Align[
+                    cute.struct.MemRange[self.sf_dtype, cute.cosize(self.sfa_smem_layout_staged)],
+                    self.buffer_align_bytes,
+                ]
+                sSFB: cute.struct.Align[
+                    cute.struct.MemRange[self.sf_dtype, cute.cosize(self.sfb_smem_layout_staged)],
+                    self.buffer_align_bytes,
+                ]
 
         self.shared_storage = SharedStorage
 
+        if cutlass.const_expr(self.enable_lora):
+            la_smem_layout_staged_arg = self.la_smem_layout_staged
+            lu_smem_layout_staged_arg = self.lu_smem_layout_staged
+        else:
+            la_smem_layout_staged_arg = None
+            lu_smem_layout_staged_arg = None
+
         self.kernel(
-            tiled_mma, tiled_mma_sfb,
+            tiled_mma, tiled_mma_sfb, tiled_mma_lora,
             tma_atom_a, tma_tensor_a,
             tma_atom_b, tma_tensor_b,
             tma_atom_sfa, tma_tensor_sfa,
             tma_atom_sfb, tma_tensor_sfb,
+            tma_atom_la, tma_tensor_la,
+            tma_atom_lu, tma_tensor_lu,
             tma_atom_c, tma_tensor_c,
             self.cluster_layout_vmnk, self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged, self.b_smem_layout_staged,
             self.sfa_smem_layout_staged, self.sfb_smem_layout_staged,
+            la_smem_layout_staged_arg, lu_smem_layout_staged_arg,
             self.c_smem_layout_staged,
             self.epi_tile,
             total_tiles_cluster,
@@ -529,10 +721,13 @@ class Sm100GemmW4A4V0FA4:
         self,
         tiled_mma: cute.TiledMma,
         tiled_mma_sfb: cute.TiledMma,
+        tiled_mma_lora,    # cute.TiledMma | None
         tma_atom_a: cute.CopyAtom, mA_mkl: cute.Tensor,
         tma_atom_b: cute.CopyAtom, mB_nkl: cute.Tensor,
         tma_atom_sfa: cute.CopyAtom, mSFA_mkl: cute.Tensor,
         tma_atom_sfb: cute.CopyAtom, mSFB_nkl: cute.Tensor,
+        tma_atom_la, mLA_mkl,    # None when enable_lora=False
+        tma_atom_lu, mLU_nkl,
         tma_atom_c: cute.CopyAtom, mC_mnl: cute.Tensor,
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
@@ -540,6 +735,8 @@ class Sm100GemmW4A4V0FA4:
         b_smem_layout_staged: cute.ComposedLayout,
         sfa_smem_layout_staged: cute.Layout,
         sfb_smem_layout_staged: cute.Layout,
+        la_smem_layout_staged,
+        lu_smem_layout_staged,
         c_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout],
         epi_tile: cute.Tile,
         total_tiles_cluster: Int32,
@@ -552,6 +749,9 @@ class Sm100GemmW4A4V0FA4:
             cpasync.prefetch_descriptor(tma_atom_b)
             cpasync.prefetch_descriptor(tma_atom_sfa)
             cpasync.prefetch_descriptor(tma_atom_sfb)
+            if cutlass.const_expr(self.enable_lora):
+                cpasync.prefetch_descriptor(tma_atom_la)
+                cpasync.prefetch_descriptor(tma_atom_lu)
             cpasync.prefetch_descriptor(tma_atom_c)
 
         # Cluster coordinate. Under 2-CTA, block_idx within the cluster
@@ -613,6 +813,27 @@ class Sm100GemmW4A4V0FA4:
             defer_sync=True,
         )
 
+        # LoRA prolog pipeline: 1-stage PipelineTmaUmma, TMA (load warp) →
+        # UMMA (mma warp). Per-tile fire + consume (LA/LU depend on the
+        # tile's m/n coords). Under persistent iteration phase flips each
+        # tile. `tx_count * atom_thr_size` bakes in the 2-CTA cluster
+        # contribution — same pattern as pipeline_aw.
+        pipeline_lora = None
+        if cutlass.const_expr(self.enable_lora):
+            lora_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+            lora_consumer_group = pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, 1,
+            )
+            pipeline_lora = pipeline.PipelineTmaUmma.create(
+                barrier_storage=storage.lora_full_mbar_ptr.data_ptr(),
+                num_stages=self.num_lora_stage,
+                producer_group=lora_producer_group,
+                consumer_group=lora_consumer_group,
+                tx_count=self.num_lora_tma_bytes,
+                cta_layout_vmnk=cluster_layout_vmnk,
+                defer_sync=True,
+            )
+
         tmem = utils.TmemAllocator(
             storage.tmem_holding_buf,
             barrier_for_retrieve=self.tmem_alloc_barrier,
@@ -631,6 +852,17 @@ class Sm100GemmW4A4V0FA4:
             b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner)
         sSFA = storage.sSFA.get_tensor(sfa_smem_layout_staged)
         sSFB = storage.sSFB.get_tensor(sfb_smem_layout_staged)
+        sLA = None
+        sLU = None
+        if cutlass.const_expr(self.enable_lora):
+            sLA = storage.sLA.get_tensor(
+                la_smem_layout_staged.outer,
+                swizzle=la_smem_layout_staged.inner,
+            )
+            sLU = storage.sLU.get_tensor(
+                lu_smem_layout_staged.outer,
+                swizzle=lu_smem_layout_staged.inner,
+            )
 
         a_full_mcast_mask = None
         b_full_mcast_mask = None
@@ -708,6 +940,45 @@ class Sm100GemmW4A4V0FA4:
         tCtAcc_fake = tiled_mma.make_fragment_C(
             cute.append(acc_shape, self.num_acc_stage))
 
+        # LoRA-side partitions + fragments. Built off tiled_mma_lora (dense
+        # fp16/bf16). Shared-tmem acc: tCtAcc_lora_fake's layout is used
+        # later in the MMA warp to alias the same tmem as the main acc —
+        # TV-layout match verified by tmp/verify_tmem_layout.py.
+        tCrLA = None
+        tCrLU = None
+        tCtAcc_lora_fake = None
+        tALsLA = None
+        tALgLA = None
+        tBLsLU = None
+        tBLgLU = None
+        if cutlass.const_expr(self.enable_lora):
+            gLA_mkl = cute.local_tile(
+                mLA_mkl, cute.slice_(self.lora_mma_tiler, (None, 0, None)),
+                (None, None, None))
+            gLU_nkl = cute.local_tile(
+                mLU_nkl, cute.slice_(self.lora_mma_tiler, (0, None, None)),
+                (None, None, None))
+            thr_mma_lora = tiled_mma_lora.get_slice(mma_tile_coord_v)
+            tCgLA = thr_mma_lora.partition_A(gLA_mkl)
+            tCgLU = thr_mma_lora.partition_B(gLU_nkl)
+            la_cta_layout = cute.make_layout(
+                cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape)
+            tALsLA, tALgLA = cpasync.tma_partition(
+                tma_atom_la, block_in_cluster_coord_vmnk[2], la_cta_layout,
+                cute.group_modes(sLA, 0, 3), cute.group_modes(tCgLA, 0, 3),
+            )
+            lu_cta_layout = cute.make_layout(
+                cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape)
+            tBLsLU, tBLgLU = cpasync.tma_partition(
+                tma_atom_lu, block_in_cluster_coord_vmnk[1], lu_cta_layout,
+                cute.group_modes(sLU, 0, 3), cute.group_modes(tCgLU, 0, 3),
+            )
+            tCrLA = tiled_mma_lora.make_fragment_A(sLA)
+            tCrLU = tiled_mma_lora.make_fragment_B(sLU)
+            acc_shape_lora = tiled_mma_lora.partition_shape_C(self.mma_tiler[:2])
+            tCtAcc_lora_fake = tiled_mma_lora.make_fragment_C(
+                cute.append(acc_shape_lora, self.num_acc_stage))
+
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
         # Per-MMA-tile count for the `tile_idx → (m_tile, n_tile, l_tile)`
@@ -732,10 +1003,15 @@ class Sm100GemmW4A4V0FA4:
 
         # =========================================================
         # LOAD warp — fires all four TMAs per K-block into pipeline_aw.
+        # v1: also fires LoRA LA/LU prolog TMA per tile into pipeline_lora
+        # (1-stage, phase flips each tile). README §Pipeline state.
         # =========================================================
         if warp_idx == self.load_warp_id:
             aw_producer_state = make_pipeline_state_simple(
                 PipelineUserType.Producer, self.num_ab_stage)
+            # Single-stage LoRA producer: phase starts at 1 (pre-armed
+            # empty by pipeline_init_arrive). Flips each tile.
+            lora_producer_phase = Int32(1)
 
             tile_idx = initial_tile_idx
             grid_stride = self._grid_stride()
@@ -744,6 +1020,35 @@ class Sm100GemmW4A4V0FA4:
                 mn_rem = tile_idx % tiles_per_l
                 m_tile = mn_rem // num_n
                 n_tile = mn_rem % num_n
+
+                # LoRA prolog: fire LA/LU TMA once per tile before main K.
+                # Uses pipeline_aw's A/B mcast masks (LA is A-like, LU is
+                # B-like) so under 2-CTA both cluster CTAs see the data.
+                if cutlass.const_expr(self.enable_lora):
+                    pipeline_lora.producer_acquire(
+                        make_pipeline_state_from_index_phase(
+                            self.num_lora_stage, Int32(0), lora_producer_phase,
+                        )
+                    )
+                    lora_bar = pipeline_lora.producer_get_barrier(
+                        make_pipeline_state_from_index_phase(
+                            self.num_lora_stage, Int32(0), lora_producer_phase,
+                        )
+                    )
+                    tALgLA_slice = tALgLA[(None, m_tile, 0, l_tile)]
+                    tBLgLU_slice = tBLgLU[(None, n_tile, 0, l_tile)]
+                    cute.copy(
+                        tma_atom_la, tALgLA_slice,
+                        tALsLA[(None, 0)],
+                        tma_bar_ptr=lora_bar,
+                        mcast_mask=a_full_mcast_mask,
+                    )
+                    cute.copy(
+                        tma_atom_lu, tBLgLU_slice,
+                        tBLsLU[(None, 0)],
+                        tma_bar_ptr=lora_bar,
+                        mcast_mask=b_full_mcast_mask,
+                    )
 
                 tAgA_slice = tAgA[(None, m_tile, None, l_tile)]
                 tBgB_slice = tBgB[(None, n_tile, None, l_tile)]
@@ -775,6 +1080,9 @@ class Sm100GemmW4A4V0FA4:
                     )
                     aw_producer_state.advance()
 
+                if cutlass.const_expr(self.enable_lora):
+                    lora_producer_phase ^= 1
+
                 tile_idx += grid_stride
 
             # Multi-stage producer_tail: drain last `num_ab_stage - 1`
@@ -782,6 +1090,16 @@ class Sm100GemmW4A4V0FA4:
             # in _setup_attributes); under 2-CTA the drain is leader-CTA
             # gated by PipelineTmaUmma's internal is_leader_cta check.
             _producer_tail_simple(pipeline_aw, aw_producer_state)
+            # Single-stage LoRA tail: bare acquire on the next phase per
+            # README §2CTA conventions and FA4 load():1505-1506 pattern.
+            # producer_tail would try to drain a non-existent slot and
+            # deadlock under 2-CTA (DEBUG_2CTA 2CTA-2).
+            if cutlass.const_expr(self.enable_lora):
+                pipeline_lora.producer_acquire(
+                    make_pipeline_state_from_index_phase(
+                        self.num_lora_stage, Int32(0), lora_producer_phase,
+                    )
+                )
 
         # =========================================================
         # MMA warp — issues one NVFP4 scaled-MMA per K-block.
@@ -825,8 +1143,20 @@ class Sm100GemmW4A4V0FA4:
             # (consumer never flips full, kernel hangs — was the 9-min hang
             # on first smoke). Mirrors stock `make_pipeline_state(Producer)`.
             acc_producer_phase = Int32(1)
+            # LoRA consumer: single-stage, mma warp is the consumer. Phase
+            # starts at 0 (producer starts at 1; see README §Pipeline state).
+            lora_consumer_phase = Int32(0)
 
             tCtAcc = tCtAcc_base[(None, None, None, 0)]
+            # Shared-tmem LoRA acc: same ptr as main, TV-layout match
+            # verified at trace time (tmp/verify_tmem_layout.py). Both
+            # MMAs' partition_C writes to identical tmem cells, so the β
+            # interleave += into the same accumulator.
+            tCtAcc_lora = None
+            if cutlass.const_expr(self.enable_lora):
+                tCtAcc_lora_base = cute.make_tensor(
+                    acc_tmem_ptr, tCtAcc_lora_fake.layout)
+                tCtAcc_lora = tCtAcc_lora_base[(None, None, None, 0)]
 
             num_kblocks = cute.size(tCrA, mode=[2])
 
@@ -840,6 +1170,20 @@ class Sm100GemmW4A4V0FA4:
                             self.num_acc_stage, Int32(0), acc_producer_phase,
                         )
                     )
+
+                # LoRA prolog wait: block until load warp's LA/LU TMA
+                # commits. Only leader CTA issues MMAs, so only leader
+                # waits on the consumer side.
+                if cutlass.const_expr(self.enable_lora):
+                    if is_leader_cta:
+                        pipeline_lora.consumer_wait(
+                            make_pipeline_state_from_index_phase(
+                                self.num_lora_stage, Int32(0),
+                                lora_consumer_phase,
+                            )
+                        )
+                    # LoRA MMA += into shared acc from the first atom.
+                    tiled_mma_lora.set(tcgen05.Field.ACCUMULATE, True)
 
                 # `tiled_mma.set(ACCUMULATE, …)` is a trace-time Python
                 # mutation — state is captured at each `cute.gemm` site
@@ -855,6 +1199,19 @@ class Sm100GemmW4A4V0FA4:
                 # unrolled block once per tile, which is the per-tile
                 # "zero then accumulate" shape we want. Mirrors kernel.py.
                 tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+
+                # β-interleave state (design §2). `stride` = # main atoms
+                # between LoRA atoms; `R_atoms` total LoRA atoms scheduled
+                # evenly across all main K atoms. tcgen05 issue queue is
+                # per-CTA in-order, so the LoRA atom sees the preceding
+                # main atom's tmem write. Leader CTA only (2-CTA: leader
+                # issues both main and LoRA, cluster MMAs propagate).
+                r_next = cutlass.Int32(0)
+                next_lora_at = cutlass.Int32(0)
+                k_atom_flat = cutlass.Int32(0)
+                if cutlass.const_expr(self.enable_lora):
+                    k_atoms_total = k_tile_cnt * num_kblocks
+                    stride = k_atoms_total // self.R_atoms
 
                 for k_tile in range(k_tile_cnt):
                     if is_leader_cta:
@@ -882,8 +1239,35 @@ class Sm100GemmW4A4V0FA4:
                                 tCrA[kblock_coord], tCrB[kblock_coord], tCtAcc,
                             )
                             tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+
+                            # β-interleave: inject LoRA atom every `stride`
+                            # main atoms. Shared-tmem acc means the LoRA
+                            # gemm += into the same tCtAcc cells (verified).
+                            if cutlass.const_expr(self.enable_lora):
+                                if r_next < self.R_atoms and k_atom_flat == next_lora_at:
+                                    lora_kblock_coord = (None, None, r_next, 0)
+                                    cute.gemm(
+                                        tiled_mma_lora, tCtAcc_lora,
+                                        tCrLA[lora_kblock_coord],
+                                        tCrLU[lora_kblock_coord],
+                                        tCtAcc_lora,
+                                    )
+                                    r_next += 1
+                                    next_lora_at += stride
+                                k_atom_flat += 1
                         pipeline_aw.consumer_release(aw_consumer_state)
                     aw_consumer_state.advance()
+
+                # LoRA consumer release (per tile; LA/LU smem freed).
+                if cutlass.const_expr(self.enable_lora):
+                    if is_leader_cta:
+                        pipeline_lora.consumer_release(
+                            make_pipeline_state_from_index_phase(
+                                self.num_lora_stage, Int32(0),
+                                lora_consumer_phase,
+                            )
+                        )
+                    lora_consumer_phase ^= 1
 
                 # Commit acc and hand off to epilogue. UmmaAsync commit
                 # uses state.index only — single-stage, index is always 0.

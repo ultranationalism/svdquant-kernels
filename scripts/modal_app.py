@@ -125,6 +125,11 @@ triton_image = (
         copy=False,
     )
     .add_local_file(
+        str(ROOT / "tmp" / "smoke_gemm_v1_fa4.py"),
+        remote_path="/root/svdquant-kernels/tmp/smoke_gemm_v1_fa4.py",
+        copy=False,
+    )
+    .add_local_file(
         str(ROOT / "tmp" / "probe_gemm_v0_fa4.py"),
         remote_path="/root/svdquant-kernels/tmp/probe_gemm_v0_fa4.py",
         copy=False,
@@ -279,6 +284,19 @@ def gemm_v0_fa4_smoke() -> None:
     subprocess.run(["nvidia-smi"], check=True)
     subprocess.run(
         ["python", "/root/svdquant-kernels/tmp/smoke_gemm_v0_fa4.py"], check=True
+    )
+
+
+@app.function(gpu="B200", image=triton_image, timeout=900)
+def gemm_v1_fa4_smoke() -> None:
+    """gemm_w4a4 v1 FA4 — main NVFP4 + LoRA β-interleave on persistent FA4
+    skeleton. 2-CTA LoRA unlocked for the first time (old kernel.py v1
+    asserts 1-CTA only). Shared-tmem TV-layout match verified at trace
+    time; this is the runtime correctness check.
+    """
+    subprocess.run(["nvidia-smi"], check=True)
+    subprocess.run(
+        ["python", "/root/svdquant-kernels/tmp/smoke_gemm_v1_fa4.py"], check=True
     )
 
 

@@ -164,9 +164,6 @@ def _check_inputs(
         assert lora_up.dtype == out_dtype, \
             f"lora_up dtype {lora_up.dtype} must match out_dtype {out_dtype}"
 
-    if use_2cta:
-        assert lora_act_in is None, \
-            "2-CTA Phase 1 does not support LoRA; set use_2cta=False when passing lora_*"
     tiler = _pick_tiler(M, R, use_2cta)
     assert M % tiler[0] == 0, f"M ({M}) must be a multiple of {tiler[0]} for tiler {tiler}"
     assert N % tiler[1] == 0, f"N ({N}) must be a multiple of {tiler[1]} for tiler {tiler}"
@@ -266,6 +263,10 @@ def launch(
     M, N, K, R, tiler = _check_inputs(
         act, wgt, ascales, wscales, out_dtype, lora_act_in, lora_up, use_2cta)
     enable_lora = lora_act_in is not None
+    # Non-persistent 1-tile-per-CTA path has never run 2-CTA + LoRA (stock
+    # PipelineState drifts). 2-CTA LoRA lives on `kernel_v0_fa4.py::launch_v0`.
+    assert not (use_2cta and enable_lora), \
+        "2-CTA + LoRA lives on cute_kernels.gemm_w4a4.kernel_v0_fa4.launch_v0"
     cluster_shape_mn = _pick_cluster(use_2cta)
     out = torch.empty((M, N), dtype=out_dtype, device=act.device)
 
