@@ -180,6 +180,11 @@ triton_image = (
         copy=False,
     )
     .add_local_file(
+        str(ROOT / "tmp" / "bench_gemm_v2_fa4_c1.py"),
+        remote_path="/root/svdquant-kernels/tmp/bench_gemm_v2_fa4_c1.py",
+        copy=False,
+    )
+    .add_local_file(
         str(ROOT / "tmp" / "probe_hwinfo.py"),
         remote_path="/root/svdquant-kernels/tmp/probe_hwinfo.py",
         copy=False,
@@ -314,6 +319,18 @@ def gemm_v2_fa4_smoke() -> None:
     subprocess.run(["nvidia-smi"], check=True)
     subprocess.run(
         ["python", "/root/svdquant-kernels/tmp/smoke_gemm_v2_fa4.py"], check=True
+    )
+
+
+@app.function(gpu="B200", image=triton_image, timeout=1800)
+def gemm_v2_fa4_c1_bench() -> None:
+    """gemm_w4a4 v2 FA4 C1 perf bench — num_lora_stage=2 hypothesis for the
+    2-CTA LoRA regression. Compare per-shape 1-CTA vs 2-CTA MFU; cross-ref
+    README v1_fa4 numbers in the bench output's footer.
+    """
+    subprocess.run(["nvidia-smi"], check=True)
+    subprocess.run(
+        ["python", "/root/svdquant-kernels/tmp/bench_gemm_v2_fa4_c1.py"], check=True
     )
 
 

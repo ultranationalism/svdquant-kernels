@@ -174,31 +174,37 @@ Takeaways:
 - Small-M (M=256) is grid-limited for both — 12 tiles vs 148 SMs,
   tensor cores idle most of the kernel. Don't over-read that row.
 
-### FA4 rewrite lineage — v0_fa4 (no LoRA) and v1_fa4 (+ LoRA)
+### FA4 rewrite lineage — v0_fa4 (no LoRA) → v2_fa4 (+ LoRA + C1)
 
-On the same `cutlass_nvfp4_bench` run, with v0_fa4 (persistent FA4
-skeleton) and v1_fa4 (+ β-interleaved LoRA on shared-tmem acc):
+On the same `cutlass_nvfp4_bench` / `gemm_v2_fa4_c1_bench` run, with
+v0_fa4 (persistent FA4 skeleton) and v2_fa4 (+ β-interleaved LoRA on
+shared-tmem acc + C1 two-stage LoRA prolog):
 
-| shape (M, K, N, R)         | v0_fa4 1-CTA | v0_fa4 2-CTA | v1_fa4 1-CTA | v1_fa4 2-CTA |
-| -------------------------- | ------------ | ------------ | ------------ | ------------ |
-| 4352, 3840, 3072, R=128    |    7.7%      |    7.6%      |    6.6%      |    6.0%      |
-| 4352, 3840, 15360, R=128   |   23.6%      |   24.2%      |   18.0%      |   15.2%      |
-| 4352, 15360, 3840, R=128   |   23.6%      |   26.4%      |   18.5%      |   17.0%      |
-| 4352, 10240, 3072, R=32    |   16.6%      |   17.1%      |   15.3%      |   11.6%      |
-| 4352, 10240, 3072, R=256   |   16.9%      |   16.9%      |   11.1%      |   SKIP*      |
+| shape (M, K, N, R)         | v0_fa4 1-CTA | v0_fa4 2-CTA | v2_fa4+C1 2-CTA | pre-C1 v1_fa4 2-CTA |
+| -------------------------- | ------------ | ------------ | --------------- | ------------------- |
+| 4352, 3840, 3072, R=128    |    7.7%      |    7.6%      |    14.2%        |    6.0%             |
+| 4352, 3840, 15360, R=128   |   23.6%      |   24.2%      |    18.6%        |   15.2%             |
+| 4352, 15360, 3840, R=128   |   23.6%      |   26.4%      |    18.1%        |   17.0%             |
+| 4352, 10240, 3072, R=32    |   16.6%      |   17.1%      |    26.1%        |   11.6%             |
+| 4352, 10240, 3072, R=256   |   16.9%      |   16.9%      |    SKIP†        |   SKIP*             |
 
-\* 2-CTA + R=256 overflows LA/LU smem (no small 2-CTA tile).
+\* 2-CTA + R=256 overflows LA/LU smem at single-stage.
+† C1 2-stage doubles LA/LU smem → R=256 no longer fits at any tile
+(production R ≤ 128; stress shape is out of scope).
 
-- **v0_fa4 beats old v0 by +1–3 pp** (persistent scheduler win).
-- **v1_fa4 LoRA cost is larger on 2-CTA than on 1-CTA**, which is
-  anomalous — LoRA FLOPs and atom count don't depend on cluster
-  size. K-heavy / N-heavy shapes regress worst (e.g., K=3840 N=15360
-  R=128: 1-CTA 18.0% vs 2-CTA 15.2%, so 2-CTA loses 2.8pp to 1-CTA
-  once LoRA is on). v0_fa4 alone gains +0.6 pp going 1→2-CTA on the
-  same shape; adding LoRA flips the sign.
-- Hypothesis (not yet measured): LoRA atom under CtaGroup.TWO incurs
-  extra `tcgen05.commit` cluster-barrier overhead per atom, or the
-  single-stage `pipeline_lora` mbar handshake is serializing across
-  the pair. Root-causing needs ncu instruction-timeline counters —
-  Modal blocks those. Rolls into the Verda profiling track (task #41
-  equivalent for 2-CTA LoRA).
+- **C1 (`num_lora_stage=2`)** lifts 2-CTA LoRA across every shape:
+  +8.2pp on the smallest (K=3840 N=3072 R=128: 6.0% → 14.2%, ~2.4×),
+  +14.5pp on R=32 (11.6% → 26.1%, ~2.2×). The pre-C1 v1_fa4 "2-CTA
+  LoRA costs more than 1-CTA" anomaly is eliminated — 2-CTA is now
+  ≥ 1-CTA on every LoRA shape (1-CTA column dropped as out of scope
+  per `CTA1 去掉`).
+- **Mechanism (inferred, ncu pending on Verda, task #48)**: single-stage
+  pipeline_lora serialized the leader-CTA LoRA TMA → LoRA MMA against
+  the main K-loop. With 2 stages, load warp prefetches next-tile LA/LU
+  while mma warp consumes current-tile. A side fix to `lora_smem_bytes`
+  accounting (was cluster-level, should be per-CTA) also freed one
+  pipeline_aw stage, contributing.
+- **v2_fa4+C1 2-CTA still 35-50pp below CUTLASS 2-CTA 256×128 ceiling**
+  (~53-59% MFU). Remaining gap is outside LoRA pipelining — stage
+  tuning, TMA/mbar micro-discipline, epilogue overlap. Counter-level
+  root-causing on Verda (task #48).

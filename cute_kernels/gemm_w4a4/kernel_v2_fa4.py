@@ -327,9 +327,17 @@ class Sm100GemmW4A4V2FA4:
                 f"LoRA R ({R}) must be a positive multiple of {_LORA_INST_K}"
             self.R_atoms = R // _LORA_INST_K
             self.lora_ab_dtype = c_dtype   # LA/LU stored at output dtype
+            # C1: 2-stage LoRA prolog so load warp can prefetch next tile's
+            # LA/LU while mma warp consumes current tile's. Hypothesis for
+            # 2-CTA LoRA regression — leader CTA is the single issue point
+            # for both main and LoRA atoms; serializing prolog TMA stalls
+            # the issue queue under 2-CTA. Doubles LoRA smem (~+64KB/CTA
+            # at R=128) — will shave ~1 stage off pipeline_aw.
+            self.num_lora_stage = 2
         else:
             self.R_atoms = 0
             self.lora_ab_dtype = None
+            self.num_lora_stage = 0
         # v2 per-col epilogue: fp32 MAC `acc = acc * wc + bias` applied in
         # rmem before cast → smem → gmem. Scales/bias stored in smem at
         # c_dtype width (nunchaku matches fp16/bf16). Flags baked compile-time.
@@ -420,11 +428,16 @@ class Sm100GemmW4A4V2FA4:
         # num_ab_stage shrinks. LA = [M, R] * dtype bytes, LU = [N, R] * dtype bytes.
         lora_smem_bytes = 0
         if cutlass.const_expr(self.enable_lora):
+            # Per-CTA smem. LA is M-sharded across cluster CTAs (cluster_shape_mn[0]
+            # = cta_group_size), so LA per-CTA = full_LA // cta_group_size. LU is
+            # N-only, not M-sharded, full on each CTA. Prior formula used the
+            # cluster-level LA (over-counted 2× under 2-CTA) — worked because
+            # 1-stage had enough slack; C1's 2× multiplier made it overflow.
             la_bytes = (self.mma_inst_shape_mn[0] * self.R
-                        * self.lora_ab_dtype.width // 8)
+                        * self.lora_ab_dtype.width // 8) // self.cta_group_size
             lu_bytes = (self.mma_inst_shape_mn[1] * self.R
                         * self.lora_ab_dtype.width // 8)
-            lora_smem_bytes = la_bytes + lu_bytes
+            lora_smem_bytes = (la_bytes + lu_bytes) * self.num_lora_stage
         # v2 wcscales / bias smem: each is [mma_tiler_n] c_dtype, single buffer.
         # Tile_n ∈ {128, 256}; at fp16 that's 256 B / 512 B — rounding error vs
         # ab_stage budget. Deducted for correctness; won't change stage count
@@ -489,7 +502,7 @@ class Sm100GemmW4A4V2FA4:
                 self.mma_inst_shape_mn[1],
                 self.R,
             )
-            self.num_lora_stage = 1   # single-buffer prolog (README §Pipelines)
+            # num_lora_stage set in __init__ (C1: 2-stage prolog).
             self.la_smem_layout_staged = sm100_utils.make_smem_layout_a(
                 tiled_mma_lora, self.lora_mma_tiler, self.lora_ab_dtype,
                 self.num_lora_stage,
@@ -1108,9 +1121,13 @@ class Sm100GemmW4A4V2FA4:
         if warp_idx == self.load_warp_id:
             aw_producer_state = make_pipeline_state_simple(
                 PipelineUserType.Producer, self.num_ab_stage)
-            # Single-stage LoRA producer: phase starts at 1 (pre-armed
-            # empty by pipeline_init_arrive). Flips each tile.
-            lora_producer_phase = Int32(1)
+            # C1: 2-stage LoRA producer — load warp prefetches next tile's
+            # LA/LU while mma warp consumes current tile's. State pre-armed
+            # by pipeline_init_arrive (first two producer_acquire calls
+            # return immediately).
+            if cutlass.const_expr(self.enable_lora):
+                lora_producer_state = make_pipeline_state_simple(
+                    PipelineUserType.Producer, self.num_lora_stage)
 
             tile_idx = initial_tile_idx
             grid_stride = self._grid_stride()
@@ -1124,27 +1141,20 @@ class Sm100GemmW4A4V2FA4:
                 # Uses pipeline_aw's A/B mcast masks (LA is A-like, LU is
                 # B-like) so under 2-CTA both cluster CTAs see the data.
                 if cutlass.const_expr(self.enable_lora):
-                    pipeline_lora.producer_acquire(
-                        make_pipeline_state_from_index_phase(
-                            self.num_lora_stage, Int32(0), lora_producer_phase,
-                        )
-                    )
+                    pipeline_lora.producer_acquire(lora_producer_state)
                     lora_bar = pipeline_lora.producer_get_barrier(
-                        make_pipeline_state_from_index_phase(
-                            self.num_lora_stage, Int32(0), lora_producer_phase,
-                        )
-                    )
+                        lora_producer_state)
                     tALgLA_slice = tALgLA[(None, m_tile, 0, l_tile)]
                     tBLgLU_slice = tBLgLU[(None, n_tile, 0, l_tile)]
                     cute.copy(
                         tma_atom_la, tALgLA_slice,
-                        tALsLA[(None, 0)],
+                        tALsLA[(None, lora_producer_state.index)],
                         tma_bar_ptr=lora_bar,
                         mcast_mask=a_full_mcast_mask,
                     )
                     cute.copy(
                         tma_atom_lu, tBLgLU_slice,
-                        tBLsLU[(None, 0)],
+                        tBLsLU[(None, lora_producer_state.index)],
                         tma_bar_ptr=lora_bar,
                         mcast_mask=b_full_mcast_mask,
                     )
@@ -1180,7 +1190,7 @@ class Sm100GemmW4A4V2FA4:
                     aw_producer_state.advance()
 
                 if cutlass.const_expr(self.enable_lora):
-                    lora_producer_phase ^= 1
+                    lora_producer_state.advance()
 
                 tile_idx += grid_stride
 
@@ -1189,16 +1199,11 @@ class Sm100GemmW4A4V2FA4:
             # in _setup_attributes); under 2-CTA the drain is leader-CTA
             # gated by PipelineTmaUmma's internal is_leader_cta check.
             _producer_tail_simple(pipeline_aw, aw_producer_state)
-            # Single-stage LoRA tail: bare acquire on the next phase per
-            # README §2CTA conventions and FA4 load():1505-1506 pattern.
-            # producer_tail would try to drain a non-existent slot and
-            # deadlock under 2-CTA (DEBUG_2CTA 2CTA-2).
+            # C1: 2-stage LoRA tail uses the standard multi-stage drain —
+            # same helper as pipeline_aw. The single-stage bare-acquire
+            # workaround (for 2CTA-2 deadlock) is no longer needed.
             if cutlass.const_expr(self.enable_lora):
-                pipeline_lora.producer_acquire(
-                    make_pipeline_state_from_index_phase(
-                        self.num_lora_stage, Int32(0), lora_producer_phase,
-                    )
-                )
+                _producer_tail_simple(pipeline_lora, lora_producer_state)
 
         # =========================================================
         # MMA warp — issues one NVFP4 scaled-MMA per K-block.
@@ -1242,9 +1247,12 @@ class Sm100GemmW4A4V2FA4:
             # (consumer never flips full, kernel hangs — was the 9-min hang
             # on first smoke). Mirrors stock `make_pipeline_state(Producer)`.
             acc_producer_phase = Int32(1)
-            # LoRA consumer: single-stage, mma warp is the consumer. Phase
-            # starts at 0 (producer starts at 1; see README §Pipeline state).
-            lora_consumer_phase = Int32(0)
+            # C1: 2-stage LoRA consumer. State starts at phase=0 index=0
+            # (Producer is pre-armed to phase=1, so the first consumer_wait
+            # on phase=0 blocks until producer commits its first slot).
+            if cutlass.const_expr(self.enable_lora):
+                lora_consumer_state = make_pipeline_state_simple(
+                    PipelineUserType.Consumer, self.num_lora_stage)
 
             tCtAcc = tCtAcc_base[(None, None, None, 0)]
             # Shared-tmem LoRA acc: same ptr as main, TV-layout match
@@ -1275,12 +1283,7 @@ class Sm100GemmW4A4V2FA4:
                 # waits on the consumer side.
                 if cutlass.const_expr(self.enable_lora):
                     if is_leader_cta:
-                        pipeline_lora.consumer_wait(
-                            make_pipeline_state_from_index_phase(
-                                self.num_lora_stage, Int32(0),
-                                lora_consumer_phase,
-                            )
-                        )
+                        pipeline_lora.consumer_wait(lora_consumer_state)
                     # LoRA MMA += into shared acc from the first atom.
                     tiled_mma_lora.set(tcgen05.Field.ACCUMULATE, True)
 
@@ -1344,7 +1347,12 @@ class Sm100GemmW4A4V2FA4:
                             # gemm += into the same tCtAcc cells (verified).
                             if cutlass.const_expr(self.enable_lora):
                                 if r_next < self.R_atoms and k_atom_flat == next_lora_at:
-                                    lora_kblock_coord = (None, None, r_next, 0)
+                                    # C1: stage dim now indexed by consumer state
+                                    # (was hardcoded 0 when num_lora_stage=1).
+                                    lora_kblock_coord = (
+                                        None, None, r_next,
+                                        lora_consumer_state.index,
+                                    )
                                     cute.gemm(
                                         tiled_mma_lora, tCtAcc_lora,
                                         tCrLA[lora_kblock_coord],
@@ -1360,13 +1368,8 @@ class Sm100GemmW4A4V2FA4:
                 # LoRA consumer release (per tile; LA/LU smem freed).
                 if cutlass.const_expr(self.enable_lora):
                     if is_leader_cta:
-                        pipeline_lora.consumer_release(
-                            make_pipeline_state_from_index_phase(
-                                self.num_lora_stage, Int32(0),
-                                lora_consumer_phase,
-                            )
-                        )
-                    lora_consumer_phase ^= 1
+                        pipeline_lora.consumer_release(lora_consumer_state)
+                    lora_consumer_state.advance()
 
                 # Commit acc and hand off to epilogue. UmmaAsync commit
                 # uses state.index only — single-stage, index is always 0.
