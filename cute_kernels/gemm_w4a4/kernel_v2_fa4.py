@@ -117,6 +117,8 @@ def launch_v2(
     wscales: torch.Tensor,
     lora_act_in: "torch.Tensor | None" = None,
     lora_up: "torch.Tensor | None" = None,
+    wcscales: "torch.Tensor | None" = None,
+    bias: "torch.Tensor | None" = None,
     *,
     out_dtype: torch.dtype = torch.float16,
     use_2cta: bool = False,
@@ -125,6 +127,9 @@ def launch_v2(
     """v0: y = scaled_mma(act_nvfp4, wgt_nvfp4). No LoRA, no affine.
     v1 (both lora_* provided): y += lora_act_in @ lora_up.T, β-interleaved
     into the main K-loop per design §2.
+    v2 (wcscales and/or bias provided): y = y * wcscales + bias applied
+    per-column in the epilogue warp — fp32 MAC in rmem right before the
+    cast to out_dtype and the TMA store. Both optional & independent.
 
     `tiler_mn` overrides the shape-adaptive pick — bench hook, do not use
     in production paths (no validation against smem / tmem budgets)."""
@@ -133,6 +138,12 @@ def launch_v2(
         lora_act_in=lora_act_in, lora_up=lora_up, use_2cta=use_2cta,
     )
     enable_lora = lora_act_in is not None
+    enable_wc = wcscales is not None
+    enable_bias = bias is not None
+    if enable_wc:
+        assert wcscales.shape == (N,), f"wcscales must be [N]; got {tuple(wcscales.shape)}"
+    if enable_bias:
+        assert bias.shape == (N,), f"bias must be [N]; got {tuple(bias.shape)}"
     tiler = tiler_mn if tiler_mn is not None else _pick_tiler_v2(M, use_2cta, R)
     assert M % tiler[0] == 0 and N % tiler[1] == 0
     cluster_shape_mn = (2, 1) if use_2cta else (1, 1)
@@ -140,7 +151,7 @@ def launch_v2(
 
     cache_key = (
         _cutlass_c_dtype(out_dtype), tiler, _SF_VEC_SIZE, cluster_shape_mn,
-        enable_lora, R,
+        enable_lora, R, enable_wc, enable_bias,
     )
     compiled = _COMPILED_CACHE.get(cache_key)
     if compiled is None:
@@ -148,6 +159,7 @@ def launch_v2(
             c_dtype=_cutlass_c_dtype(out_dtype), tiler_mn=tiler,
             cluster_shape_mn=cluster_shape_mn,
             enable_lora=enable_lora, R=R,
+            enable_wc=enable_wc, enable_bias=enable_bias,
         )
         _COMPILED_CACHE[cache_key] = compiled
 
@@ -173,12 +185,37 @@ def launch_v2(
             _cutlass_c_dtype(out_dtype), 0, cute.AddressSpace.gmem, assumed_align=16)
         lu_ptr = make_ptr(
             _cutlass_c_dtype(out_dtype), 0, cute.AddressSpace.gmem, assumed_align=16)
+    # wcscales / bias host prep: cast to out_dtype, match c_dtype smem/reg
+    # path. Tiny buffers ([N] * 2 B) — cast cost irrelevant. Dummy ptrs when
+    # disabled so the kernel signature stays uniform (same compile cache key
+    # shape).
+    if enable_wc:
+        wc_cast = (
+            wcscales.to(out_dtype).contiguous()
+            if wcscales.dtype != out_dtype
+            else wcscales.contiguous()
+        )
+        wc_ptr = _c_ptr(wc_cast)
+    else:
+        wc_ptr = make_ptr(
+            _cutlass_c_dtype(out_dtype), 0, cute.AddressSpace.gmem, assumed_align=16)
+    if enable_bias:
+        bias_cast = (
+            bias.to(out_dtype).contiguous()
+            if bias.dtype != out_dtype
+            else bias.contiguous()
+        )
+        bias_ptr = _c_ptr(bias_cast)
+    else:
+        bias_ptr = make_ptr(
+            _cutlass_c_dtype(out_dtype), 0, cute.AddressSpace.gmem, assumed_align=16)
     compiled(
         _fp4_ptr(act),
         _fp4_ptr(wgt),
         _sf_ptr(ascales_atom),
         _sf_ptr(wscales_atom),
         la_ptr, lu_ptr,
+        wc_ptr, bias_ptr,
         _c_ptr(out),
         (cutlass.Int32(M), cutlass.Int32(N), cutlass.Int32(K), cutlass.Int32(1)),
         stream,
@@ -193,6 +230,8 @@ def _compile_v2(
     cluster_shape_mn: Tuple[int, int],
     enable_lora: bool = False,
     R: int = 0,
+    enable_wc: bool = False,
+    enable_bias: bool = False,
 ):
     kernel_obj = Sm100GemmW4A4V2FA4(
         sf_vec_size=_SF_VEC_SIZE,
@@ -203,6 +242,8 @@ def _compile_v2(
         c_dtype=c_dtype,
         enable_lora=enable_lora,
         R=R,
+        enable_wc=enable_wc,
+        enable_bias=enable_bias,
     )
     a_ptr = make_ptr(cutlass.Float4E2M1FN, 0, cute.AddressSpace.gmem, assumed_align=32)
     b_ptr = make_ptr(cutlass.Float4E2M1FN, 0, cute.AddressSpace.gmem, assumed_align=32)
@@ -210,12 +251,15 @@ def _compile_v2(
     sfb_ptr = make_ptr(cutlass.Float8E4M3FN, 0, cute.AddressSpace.gmem, assumed_align=16)
     la_ptr = make_ptr(c_dtype, 0, cute.AddressSpace.gmem, assumed_align=16)
     lu_ptr = make_ptr(c_dtype, 0, cute.AddressSpace.gmem, assumed_align=16)
+    wc_ptr = make_ptr(c_dtype, 0, cute.AddressSpace.gmem, assumed_align=16)
+    bias_ptr = make_ptr(c_dtype, 0, cute.AddressSpace.gmem, assumed_align=16)
     c_ptr = make_ptr(c_dtype, 0, cute.AddressSpace.gmem, assumed_align=16)
     dummy_stream = cuda_drv.CUstream(0)
 
     return cute.compile(
         kernel_obj,
-        a_ptr, b_ptr, sfa_ptr, sfb_ptr, la_ptr, lu_ptr, c_ptr,
+        a_ptr, b_ptr, sfa_ptr, sfb_ptr, la_ptr, lu_ptr,
+        wc_ptr, bias_ptr, c_ptr,
         (cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0)),
         dummy_stream,
     )
@@ -246,6 +290,8 @@ class Sm100GemmW4A4V2FA4:
         c_dtype: Type[cutlass.Numeric],
         enable_lora: bool = False,
         R: int = 0,
+        enable_wc: bool = False,
+        enable_bias: bool = False,
     ):
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
@@ -284,6 +330,11 @@ class Sm100GemmW4A4V2FA4:
         else:
             self.R_atoms = 0
             self.lora_ab_dtype = None
+        # v2 per-col epilogue: fp32 MAC `acc = acc * wc + bias` applied in
+        # rmem before cast → smem → gmem. Scales/bias stored in smem at
+        # c_dtype width (nunchaku matches fp16/bf16). Flags baked compile-time.
+        self.enable_wc = enable_wc
+        self.enable_bias = enable_bias
         self.a_major_mode = tcgen05.OperandMajorMode.K
         self.b_major_mode = tcgen05.OperandMajorMode.K
         self.c_layout = utils.LayoutEnum.ROW_MAJOR
@@ -374,11 +425,20 @@ class Sm100GemmW4A4V2FA4:
             lu_bytes = (self.mma_inst_shape_mn[1] * self.R
                         * self.lora_ab_dtype.width // 8)
             lora_smem_bytes = la_bytes + lu_bytes
+        # v2 wcscales / bias smem: each is [mma_tiler_n] c_dtype, single buffer.
+        # Tile_n ∈ {128, 256}; at fp16 that's 256 B / 512 B — rounding error vs
+        # ab_stage budget. Deducted for correctness; won't change stage count
+        # in practice.
+        wcbias_smem_bytes = 0
+        if cutlass.const_expr(self.enable_wc):
+            wcbias_smem_bytes += self.mma_inst_shape_mn[1] * self.c_dtype.width // 8
+        if cutlass.const_expr(self.enable_bias):
+            wcbias_smem_bytes += self.mma_inst_shape_mn[1] * self.c_dtype.width // 8
         self.num_acc_stage, self.num_ab_stage, self.num_c_stage = self._compute_stages(
             tiled_mma, self.mma_tiler, self.ab_dtype, self.ab_dtype,
             self.epi_tile, self.c_dtype, self.c_layout,
             self.sf_dtype, self.sf_vec_size,
-            self.smem_capacity - lora_smem_bytes, self.occupancy,
+            self.smem_capacity - lora_smem_bytes - wcbias_smem_bytes, self.occupancy,
         )
         assert self.num_ab_stage >= 2, \
             f"num_ab_stage = {self.num_ab_stage} — smem budget too tight"
@@ -513,6 +573,8 @@ class Sm100GemmW4A4V2FA4:
         sfb_ptr: cute.Pointer,
         la_ptr: cute.Pointer,
         lu_ptr: cute.Pointer,
+        wc_ptr: cute.Pointer,
+        bias_ptr: cute.Pointer,
         c_ptr: cute.Pointer,
         problem_mnkl: Tuple[Int32, Int32, Int32, Int32],
         stream,
@@ -617,6 +679,21 @@ class Sm100GemmW4A4V2FA4:
             ) * atom_thr_size
         self.num_lora_tma_bytes = num_lora_tma_bytes
 
+        # v2 wcscales / bias gmem tensors. 1-D [N] at c_dtype; the epilogue
+        # warp does a cooperative scalar gmem→smem load per tile (small:
+        # mma_tiler_n ≤ 256 elts). Dummy-layout tensors when disabled so
+        # cute.compile sees a consistent type signature (mirrors LoRA pattern).
+        if cutlass.const_expr(self.enable_wc):
+            wc_layout = cute.make_layout((cute.assume(n, 32),))
+            mWC_tensor = cute.make_tensor(wc_ptr, wc_layout)
+        else:
+            mWC_tensor = None
+        if cutlass.const_expr(self.enable_bias):
+            bias_layout = cute.make_layout((cute.assume(n, 32),))
+            mBias_tensor = cute.make_tensor(bias_ptr, bias_layout)
+        else:
+            mBias_tensor = None
+
         epi_smem_layout = cute.slice_(self.c_smem_layout_staged, (None, None, 0))
         tma_atom_c, tma_tensor_c = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileS2GOp(),
@@ -717,6 +794,7 @@ class Sm100GemmW4A4V2FA4:
             tma_atom_sfb, tma_tensor_sfb,
             tma_atom_la, tma_tensor_la,
             tma_atom_lu, tma_tensor_lu,
+            mWC_tensor, mBias_tensor,
             tma_atom_c, tma_tensor_c,
             self.cluster_layout_vmnk, self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged, self.b_smem_layout_staged,
@@ -747,6 +825,8 @@ class Sm100GemmW4A4V2FA4:
         tma_atom_sfb: cute.CopyAtom, mSFB_nkl: cute.Tensor,
         tma_atom_la, mLA_mkl,    # None when enable_lora=False
         tma_atom_lu, mLU_nkl,
+        mWC_tensor,              # None when enable_wc=False; else cute.Tensor shape [N]
+        mBias_tensor,            # None when enable_bias=False; else cute.Tensor shape [N]
         tma_atom_c: cute.CopyAtom, mC_mnl: cute.Tensor,
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
@@ -1346,6 +1426,26 @@ class Sm100GemmW4A4V2FA4:
             tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
             subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
 
+            # v2 per-col apply: identity coord tensor over the tile's (M, N),
+            # partitioned with the same t2r thread layout. tTR_cC[i] yields
+            # the tile-local (m, n) coord for rmem element i; n coord → gmem
+            # index via `n_local + n_tile * mma_tiler_n`. `.partition_D` +
+            # `flat_divide` + group_modes mirrors the tAcc path exactly so
+            # shapes align with tTR_rAcc.
+            #
+            # CRITICAL under 2-CTA: use `cta_tile_shape_mnk` (per-CTA shape,
+            # M-halved) not `mma_tiler` (cluster shape). tiled_copy_t2r is
+            # built on per-CTA tmem; feeding it a 256×128 identity when it
+            # expects 128×128 silently mispartitions the N-coord (observed
+            # as ~0.7 rel err on 2-CTA wc runs before this fix).
+            if cutlass.const_expr(self.enable_wc or self.enable_bias):
+                cC_tile = cute.make_identity_tensor(
+                    (self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1]))
+                cC_epi = cute.flat_divide(cC_tile, epi_tile)
+                thr_copy_t2r_epi = tiled_copy_t2r.get_slice(epi_tidx)
+                tTR_cC = thr_copy_t2r_epi.partition_D(cC_epi)
+                tTR_cC = cute.group_modes(tTR_cC, 3, cute.rank(tTR_cC))
+
             acc_consumer_phase = Int32(0)
 
             tile_idx = initial_tile_idx
@@ -1369,6 +1469,27 @@ class Sm100GemmW4A4V2FA4:
                 for subtile_idx in cutlass.range(subtile_cnt):
                     tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
                     cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
+
+                    # v2 per-col affine: `acc = acc * wc[n] + bias[n]` in fp32
+                    # (rmem scalar loop). Unroll_full over tTR_rAcc elements —
+                    # element count is tiny (≤ 16 per thread after tmem load),
+                    # per-element gmem read is absorbed into L2 hit path since
+                    # the same n_tile is reused across all 4 epi warps and
+                    # subtiles of this tile.
+                    if cutlass.const_expr(self.enable_wc or self.enable_bias):
+                        tTR_cC_sub = tTR_cC[(None, None, None, subtile_idx)]
+                        n_tile_base = n_tile * self.mma_tiler[1]
+                        for i in cutlass.range(
+                            cute.size(tTR_rAcc), unroll_full=True,
+                        ):
+                            n_local = tTR_cC_sub[i][1]
+                            n_global = n_local + n_tile_base
+                            val = tTR_rAcc[i]
+                            if cutlass.const_expr(self.enable_wc):
+                                val = val * mWC_tensor[n_global].to(cutlass.Float32)
+                            if cutlass.const_expr(self.enable_bias):
+                                val = val + mBias_tensor[n_global].to(cutlass.Float32)
+                            tTR_rAcc[i] = val
 
                     acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
                     acc_vec = acc_vec.to(self.c_dtype)

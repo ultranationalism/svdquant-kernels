@@ -130,6 +130,11 @@ triton_image = (
         copy=False,
     )
     .add_local_file(
+        str(ROOT / "tmp" / "smoke_gemm_v2_fa4.py"),
+        remote_path="/root/svdquant-kernels/tmp/smoke_gemm_v2_fa4.py",
+        copy=False,
+    )
+    .add_local_file(
         str(ROOT / "tmp" / "probe_gemm_v0_fa4.py"),
         remote_path="/root/svdquant-kernels/tmp/probe_gemm_v0_fa4.py",
         copy=False,
@@ -297,6 +302,18 @@ def gemm_v1_fa4_smoke() -> None:
     subprocess.run(["nvidia-smi"], check=True)
     subprocess.run(
         ["python", "/root/svdquant-kernels/tmp/smoke_gemm_v1_fa4.py"], check=True
+    )
+
+
+@app.function(gpu="B200", image=triton_image, timeout=1800)
+def gemm_v2_fa4_smoke() -> None:
+    """gemm_w4a4 v2 FA4 — v1 + per-col `y = y * wcscales + bias` fp32 MAC
+    applied in the epilogue warp before cast to out_dtype. Covers 4×
+    {wc,bias} toggles × 1-CTA/2-CTA × fp16/bf16 × shape set.
+    """
+    subprocess.run(["nvidia-smi"], check=True)
+    subprocess.run(
+        ["python", "/root/svdquant-kernels/tmp/smoke_gemm_v2_fa4.py"], check=True
     )
 
 

@@ -25,7 +25,9 @@ fp32 ground truth — what this kernel must match per `tmp/smoke_gemm.py`).
 | v2      | + per-col `* wcscales + bias` epilogue                       |
 | v3      | + optional next-layer NVFP4 quantize                         |
 
-Currently at v1 (task #34).
+Currently at v2 (task #35). `kernel_v0_fa4.py` is frozen as the v0/v1
+reference (flag-gated on `enable_lora`); `kernel_v2_fa4.py` is the
+post-processing fork (v1 + per-col `* wcscales + bias` in the epilogue).
 
 **Reference skeleton**: Flash-Attention 4 (FA4) Blackwell forward in
 `tmp/flash-attention/flash_attn/cute/`:
