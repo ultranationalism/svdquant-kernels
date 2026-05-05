@@ -40,12 +40,14 @@
 - [x] `csrc/kernels/CMakeLists.txt` 的 `svdquant_add_kernel_pod` 检测 `kernel_device.cpp`，用 `ascendc_library(... STATIC ...)` + `ascendc_include_directories(... PTO_INCLUDE_DIR ...)` 编，最后 `target_link_libraries(host_obj PUBLIC <pod>_device)`。
 - [x] `./scripts/build.sh CUDA=OFF ASCEND=ON` 产出 `lib/libsvdquant_gemm_w4a4_device.a` (~1.1MB，含 ascendc 运行时 + AIC/AIV merged device blob + host_stub)。
 
-#### Phase 1b — host launcher 起空 kernel（pending）
+#### Phase 1b — host launcher 起空 kernel ✅（编译/链接层）
 
-- [ ] `ascend/kernel.cpp` 改造：从 `GemmW4A4Params` 解出 shape，分配/包装 GM tensor → 一个 host 端的 `params` blob，调 ascendc 自动生成的 host_stub `svdquant_gemm_w4a4_kernel(blockDim, stream, params)`。
-- [ ] OpenI 上 smoke：`ship.sh` 上传，跑 trivial Python 调用，确认 kernel 能 launch、能 return（不要求结果正确）。
+- [x] `ascend/kernel.cpp` 改造：`aclrtMalloc` device blob + `aclrtMemcpy` H2D + `aclrtlaunch_svdquant_gemm_w4a4_kernel(blockDim=1, stream, dev_params)` + `aclrtFree`。
+- [x] auto-gen header `aclrtlaunch_svdquant_gemm_w4a4_kernel.h` 通过 device 静态库的 INTERFACE include propagation 自动可见。
+- [x] `tmp/smoke_gemm_w4a4_link.cpp` 验证 host obj + device 静态库 + ascendcl/runtime/tiling_api/... 一组依赖能链通（产出 ELF）。
+- [ ] **OpenI NPU smoke**（pending external）：本地 WSL2 没 NPU 驱动，`__register_kernels` constructor 一启动就 `RegisterAscendBinary` 失败。要在 OpenI Atlas A2/A3 pod 上跑——`ship.sh` 上传 build artifacts，trivial 调用 `svdquant::ascend::gemm_w4a4(...)` + `aclrtSynchronizeStream`，确认 kernel launch + return（不要求结果正确）。
 
-**完工标志**：build 绿 + NPU smoke 不死。
+**当前状态**：编译/链接全绿。NPU 运行验证待 OpenI smoke。
 
 ### Phase 2 — Cube/Vec 协作骨架（通信不死锁）
 
