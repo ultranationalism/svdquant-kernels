@@ -22,7 +22,7 @@ if [[ -z "${SVDQUANT_BUILD_CLEAN_ENV:-}" ]]; then
         USER="${USER:-root}" \
         TERM="${TERM:-dumb}" \
         LANG="${LANG:-C.UTF-8}" \
-        PATH="/usr/local/cuda-13.0/bin:/usr/bin:/bin" \
+        PATH="/usr/local/cuda-13.0/bin:/usr/local/Ascend/cann-8.5.0/x86_64-linux/bin:/usr/local/Ascend/cann-8.5.0/x86_64-linux/ccec_compiler/bin:/usr/bin:/bin" \
         ASCEND_HOME_PATH="${ASCEND_HOME_PATH:-/usr/local/Ascend/ascend-toolkit/latest}" \
         BUILD_DIR="${BUILD_DIR:-}" \
         BUILD_TYPE="${BUILD_TYPE:-}" \

@@ -40,6 +40,19 @@ if(CANN_ROOT)
               ${CANN_ROOT}/bin
     )
 
+    # ascendc.cmake — drives the ccec cross-compile of __aicore__ device
+    # sources. Its location varies by CANN packaging (toolkit vs devkit
+    # vs older layouts). The layout under x86_64-linux/tikcpp matches
+    # what `pto-isa/demos/baseline/gemm_basic/CMakeLists.txt` looks for.
+    find_file(CANN_ASCENDC_CMAKE
+        NAMES ascendc.cmake
+        HINTS ${CANN_ROOT}/tools/tikcpp/ascendc_kernel_cmake
+              ${CANN_ROOT}/compiler/tikcpp/ascendc_kernel_cmake
+              ${CANN_ROOT}/x86_64-linux/tikcpp/ascendc_kernel_cmake
+              ${CANN_ROOT}/ascendc_devkit/tikcpp/samples/cmake
+              ${CANN_ROOT}/../../cann-8.5.0/x86_64-linux/tikcpp/ascendc_kernel_cmake
+    )
+
     set(CANN_LIBRARIES ${CANN_ASCENDCL} ${CANN_RUNTIME})
 endif()
 
@@ -48,4 +61,4 @@ find_package_handle_standard_args(CANN
     REQUIRED_VARS CANN_ROOT CANN_INCLUDE_DIRS
 )
 
-mark_as_advanced(CANN_ROOT CANN_ASCENDCL CANN_RUNTIME CANN_ASCENDC_COMPILER)
+mark_as_advanced(CANN_ROOT CANN_ASCENDCL CANN_RUNTIME CANN_ASCENDC_COMPILER CANN_ASCENDC_CMAKE)

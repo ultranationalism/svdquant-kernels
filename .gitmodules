@@ -1,0 +1,3 @@
+[submodule "pto-isa"]
+	path = pto-isa
+	url = https://github.com/ultranationalism/pto-isa.git
